@@ -1,16 +1,30 @@
-# 合并补丁 v2：修复 CacheProbe 不出现
+# 稳定回滚补丁：保留流式修复 + 尾部动态注入，关闭 CacheProbe 折腾
 
-这个版本修正了上一版的问题：诊断函数定义了，但没有被调用，所以 Zeabur 搜不到 `CacheProbe`。
+这个版本用于先把好荀网关恢复到稳定状态：
+
+- 保留 `stream was reset: PROTOCOL_ERROR` 的修复
+- 保留尾部动态注入
+- 保留 DeepSeek `user_id`
+- 不再打印 CacheProbe
+- 不再强制改 `thinking=disabled/enabled`
 
 ## 使用方式
 
-1. 用本包里的 `gateway.py` 覆盖项目里的 `gateway.py`
-2. Zeabur 环境变量确认：
+用本包里的 `gateway.py` 覆盖当前项目里的 `gateway.py`，重新部署 Zeabur。
+
+## Zeabur 环境变量建议
+
+先删掉或关闭这些诊断/实验变量：
 
 ```env
-DEBUG_CACHE_HASH=true
+DEBUG_CACHE_HASH=false
+# 删除 DEEPSEEK_THINKING，或者留空
+```
+
+保留/设置这些：
+
+```env
 DEEPSEEK_USER_ID=chacha
-DEEPSEEK_THINKING=enabled
 
 CACHE_FRIENDLY_MODE=true
 TIME_INJECTION=hour
@@ -22,23 +36,30 @@ USER_FACT_LIMIT=40
 USER_FACT_VALUE_CHARS=500
 ```
 
-3. Redeploy
-4. 发一条消息
-5. 在运行日志里搜：
+如果回复太慢，可以临时降：
+
+```env
+VECTOR_TOP_K=1
+VECTOR_MEMORY_CHARS=500
+```
+
+## 判断是否恢复
+
+Zeabur 日志里应该看到：
+
+```txt
+[智能体/尾部动态注入] 注入完成
+[DeepSeek] user_id=chacha，thinking 使用默认/前端设置
+```
+
+不应该再看到：
 
 ```txt
 CacheProbe
+thinking=disabled
 ```
 
-## 正常应该看到
+## 下一步
 
-```txt
-🧪 [CacheProbe] DEBUG_CACHE_HASH=true，准备打印本轮请求前缀 hash
-🧪 [CacheProbe] shape=...
-🧪 [CacheProbe] prefix_messages=1, hash=...
-🧪 [CacheProbe] full_prefix_chars=2000, hash=...
-```
-
-## 测完关闭
-
-把 `DEBUG_CACHE_HASH` 改成 `false` 或删掉，避免日志太吵。
+先稳定聊天和流式输出。缓存问题先停一下。  
+目前 1.3K～2.8K cached 属于 DeepSeek 自动缓存在这套动态记忆网关里的现实表现，不适合继续靠盲改补丁硬追。
