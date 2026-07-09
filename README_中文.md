@@ -1,42 +1,62 @@
-# 尾部动态注入缓存补丁
+# DeepSeek 缓存命中对照补丁
 
-这个补丁基于上一版 `stream_protocol_hotfix`，继续优化 DeepSeek prompt cache。
+这个补丁基于尾部动态注入版 `gateway.py`，新增两个实验能力：
 
-## 为什么要改
+1. 给 DeepSeek 官方 API 请求传 `user_id`
+2. 通过环境变量临时开关 DeepSeek thinking mode
 
-如果动态内容（当前时间、Pinecone 检索、Supabase 最近历史）和稳定人设写在同一个 system 里，DeepSeek 只能缓存到第一个变化点之前。你看到 `prompt_cache_hit_tokens` 卡在约 2.3K，就是因为前 2.3K 后面开始出现动态内容，后面的前缀每轮都变。
+## 为什么要做
 
-## 这版怎么改
+你现在的缓存命中大概卡在 2.7K tokens。  
+DeepSeek 官方缓存是自动前缀缓存，不是 Claude 那种手动 cache_control。  
+所以我们要确认卡住的原因是不是：
 
-- 稳定内容仍放最前面：AI_PERSONA、user_facts、Core_Cognition
-- 动态内容移到最后一条 user 消息前：当前时间、沉默时长、Pinecone 本轮召回、Supabase 最近历史
-- 保留上一版协议修复：删除 `connection: keep-alive`，避免 RikkaHub HTTP/2 SSE reset
+- 没传稳定 user_id，DeepSeek 侧 KVCache 隔离不稳定
+- thinking mode 的 `reasoning_content` 没被前端完整带回，导致后续对话无法继续复用更长前缀
 
-## 推荐环境变量
+## 使用方法
+
+把本包里的 `gateway.py` 覆盖项目原来的 `gateway.py`，重新部署 Zeabur。
+
+## Zeabur 环境变量：第一轮测试
+
+先加这些：
 
 ```env
+DEEPSEEK_USER_ID=chacha
+DEEPSEEK_THINKING=disabled
+
 CACHE_FRIENDLY_MODE=true
 TIME_INJECTION=hour
-INJECT_SILENCE_HOURS=true
-HISTORY_LIMIT=4
-VECTOR_TOP_K=3
-VECTOR_MEMORY_CHARS=1000
+INJECT_SILENCE_HOURS=false
+HISTORY_LIMIT=0
+VECTOR_TOP_K=2
+VECTOR_MEMORY_CHARS=800
 USER_FACT_LIMIT=40
 USER_FACT_VALUE_CHARS=500
 ```
 
-## 验证
+然后在同一个 RikkaHub 会话连续聊 3～5 轮，看 cached tokens 是否突破 2.7K。
 
-Zeabur 日志应出现：
+## 如果缓存明显上涨
 
-```txt
-🧠 [智能体/尾部动态注入] 注入完成
+说明 thinking mode / reasoning_content 很可能影响了缓存复用。  
+之后你可以选择：
+
+- 日常模型用 thinking disabled，速度和缓存更稳
+- 需要推理时再开 thinking enabled
+
+## 如果缓存还是卡在 2.7K
+
+说明问题大概率不是 thinking，而是 RikkaHub/网关每轮拼出来的前缀在 2.7K 后发生变化。  
+下一步就要打印 messages 前缀 hash 来定位到底哪一段变了。
+
+## 恢复 thinking
+
+把环境变量改成：
+
+```env
+DEEPSEEK_THINKING=enabled
 ```
 
-DeepSeek 的缓存命中不一定立刻暴涨，因为它是 best-effort，会在几次请求后逐渐稳定。连续聊同一会话时，命中应不再固定死在 2.3K 左右，而是有机会命中：
-
-- 稳定人设 + 用户画像
-- 前端传来的已有聊天历史
-- 前一轮已持久化的长前缀
-
-如果 RikkaHub 没有把完整历史发给网关，而是只发当前一轮，那命中仍会主要停在稳定 system 部分。这不是补丁失效，是前端请求本身没有可复用的历史前缀。
+或者直接删掉 `DEEPSEEK_THINKING`。
