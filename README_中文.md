@@ -1,23 +1,50 @@
-# 网关缓存友好补丁
+# RikkaHub stream was reset: PROTOCOL_ERROR 热修补丁
 
-这个补丁只改 `gateway.py` 里的 `_inject_context()`，目标是提高 DeepSeek prompt cache 命中：
+这个补丁基于“缓存友好版 gateway.py”，额外修复一个 SSE/HTTP2 兼容问题。
 
-- 稳定内容放前面：AI_PERSONA / user_facts / Core_Cognition
-- 动态内容放后面：当前时间 / 沉默时长 / Pinecone 本轮检索 / 最近历史
-- 默认不注入分钟级时间，只注入日期
-- 默认最近历史从 10 条降为 6 条
-- 默认 Pinecone 召回从 5 条降为 3 条
+## 修了什么
 
-## 使用方法
+删除网关返回给前端时的响应头：
 
-把本包里的 `gateway.py` 覆盖你项目里的原 `gateway.py`，提交/重新部署 Zeabur。
+```txt
+connection: keep-alive
+```
 
-## 推荐 Zeabur 环境变量
+原因：`Connection` 是 HTTP/1.1 hop-by-hop header，HTTP/2 不允许这个头。  
+RikkaHub/Android/代理链路如果走 HTTP/2，可能会直接把流重置，报：
+
+```txt
+stream was reset: PROTOCOL_ERROR
+```
+
+## 额外小优化
+
+把上游流式读取从：
+
+```python
+resp.iter_lines()
+```
+
+改成：
+
+```python
+resp.iter_lines(chunk_size=1, decode_unicode=True)
+```
+
+这样流会更及时一点，也避免 decode 重复处理。
+
+## 使用方式
+
+1. 用本包里的 `gateway.py` 覆盖项目原来的 `gateway.py`
+2. 重新部署 Zeabur
+3. RikkaHub 重新发一条消息测试
+
+## 环境变量建议
 
 ```env
 CACHE_FRIENDLY_MODE=true
-TIME_INJECTION=date
-INJECT_SILENCE_HOURS=false
+TIME_INJECTION=hour
+INJECT_SILENCE_HOURS=true
 HISTORY_LIMIT=6
 VECTOR_TOP_K=3
 VECTOR_MEMORY_CHARS=1200
@@ -25,34 +52,11 @@ USER_FACT_LIMIT=40
 USER_FACT_VALUE_CHARS=500
 ```
 
-## 想更省 token / 更高缓存
+如果仍然偶发断流，先测试：
 
 ```env
-TIME_INJECTION=off
-HISTORY_LIMIT=4
 VECTOR_TOP_K=2
-VECTOR_MEMORY_CHARS=800
+HISTORY_LIMIT=4
 ```
 
-## 想更强记忆召回
-
-```env
-TIME_INJECTION=date
-HISTORY_LIMIT=8
-VECTOR_TOP_K=5
-VECTOR_MEMORY_CHARS=1600
-```
-
-## 查看是否生效
-
-Zeabur 日志里应该出现：
-
-```txt
-🧠 [智能体/缓存友好] 注入完成：...
-```
-
-并显示：
-
-```txt
-time=date, history=6, vector_top_k=3
-```
+确认是不是 prompt 太长或上游推理太久导致代理断开。
