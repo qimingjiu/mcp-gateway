@@ -1,30 +1,22 @@
-# DeepSeek 缓存命中对照补丁
+# DeepSeek 缓存前缀 Hash 诊断补丁
 
-这个补丁基于尾部动态注入版 `gateway.py`，新增两个实验能力：
+这个补丁不是优化补丁，是“抓小偷”补丁：  
+它只在 Zeabur 日志里打印哈希，不打印正文、不打印 Key。
 
-1. 给 DeepSeek 官方 API 请求传 `user_id`
-2. 通过环境变量临时开关 DeepSeek thinking mode
+## 用途
 
-## 为什么要做
-
-你现在的缓存命中大概卡在 2.7K tokens。  
-DeepSeek 官方缓存是自动前缀缓存，不是 Claude 那种手动 cache_control。  
-所以我们要确认卡住的原因是不是：
-
-- 没传稳定 user_id，DeepSeek 侧 KVCache 隔离不稳定
-- thinking mode 的 `reasoning_content` 没被前端完整带回，导致后续对话无法继续复用更长前缀
+你现在 cached tokens 固定在 2.3K～2.8K。  
+这个补丁用来判断：到底是哪一段 prompt 每轮在变，导致 DeepSeek 只能缓存前面一点。
 
 ## 使用方法
 
-把本包里的 `gateway.py` 覆盖项目原来的 `gateway.py`，重新部署 Zeabur。
-
-## Zeabur 环境变量：第一轮测试
-
-先加这些：
+1. 用本包里的 `gateway.py` 覆盖当前项目里的 `gateway.py`
+2. Zeabur 环境变量加：
 
 ```env
+DEBUG_CACHE_HASH=true
 DEEPSEEK_USER_ID=chacha
-DEEPSEEK_THINKING=disabled
+DEEPSEEK_THINKING=enabled
 
 CACHE_FRIENDLY_MODE=true
 TIME_INJECTION=hour
@@ -36,27 +28,38 @@ USER_FACT_LIMIT=40
 USER_FACT_VALUE_CHARS=500
 ```
 
-然后在同一个 RikkaHub 会话连续聊 3～5 轮，看 cached tokens 是否突破 2.7K。
+3. Redeploy
+4. 在同一个 RikkaHub 会话连续发 3 条短消息，比如：
+   - 测试缓存一
+   - 测试缓存二
+   - 测试缓存三
 
-## 如果缓存明显上涨
+## 看日志
 
-说明 thinking mode / reasoning_content 很可能影响了缓存复用。  
-之后你可以选择：
+Zeabur 运行日志里会出现类似：
 
-- 日常模型用 thinking disabled，速度和缓存更稳
-- 需要推理时再开 thinking enabled
-
-## 如果缓存还是卡在 2.7K
-
-说明问题大概率不是 thinking，而是 RikkaHub/网关每轮拼出来的前缀在 2.7K 后发生变化。  
-下一步就要打印 messages 前缀 hash 来定位到底哪一段变了。
-
-## 恢复 thinking
-
-把环境变量改成：
-
-```env
-DEEPSEEK_THINKING=enabled
+```txt
+🧪 [CacheProbe] shape=...
+🧪 [CacheProbe] prefix_messages=1, hash=xxxx, chars=...
+🧪 [CacheProbe] prefix_messages=2, hash=yyyy, chars=...
+🧪 [CacheProbe] full_prefix_chars=2000, hash=...
+🧪 [CacheProbe] full_prefix_chars=4000, hash=...
 ```
 
-或者直接删掉 `DEEPSEEK_THINKING`。
+## 怎么判断
+
+如果每轮 `full_prefix_chars=2000` hash 都一样，但 `full_prefix_chars=4000` 开始变，  
+就说明 DeepSeek 只能命中约 2K～4K 前缀，很符合你现在的 2.3K cached。
+
+如果 `prefix_messages=1` 每轮都变，说明 system prompt 第一条就在变。  
+如果 `prefix_messages=1` 稳定，但 `prefix_messages=2` 开始变，说明第二条消息开始变。
+
+## 重要
+
+测完记得把：
+
+```env
+DEBUG_CACHE_HASH=false
+```
+
+或者删掉这个环境变量，避免日志太吵。

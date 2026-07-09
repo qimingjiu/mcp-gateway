@@ -22,6 +22,7 @@ import json
 import asyncio
 import time
 import datetime
+import hashlib
 import re
 import requests
 
@@ -42,6 +43,70 @@ def _log(msg: str):
     _system_logs_buffer.append(line)
     if len(_system_logs_buffer) > _MAX_LOGS:
         del _system_logs_buffer[: len(_system_logs_buffer) - _MAX_LOGS]
+
+
+def _stable_json_dumps(obj):
+    try:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(obj)
+
+def _sha12(text):
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+def _log_deepseek_cache_probe(req_data, stage="before_upstream"):
+    """Log prefix fingerprints only; never log prompt content or keys."""
+    try:
+        if os.environ.get("DEBUG_CACHE_HASH", "").strip().lower() not in ("1", "true", "yes", "on"):
+            return
+
+        messages = req_data.get("messages") or []
+        # Log global request shape
+        shape = {
+            "stage": stage,
+            "model": req_data.get("model"),
+            "stream": req_data.get("stream"),
+            "thinking": req_data.get("thinking"),
+            "reasoning_effort": req_data.get("reasoning_effort"),
+            "user_id": req_data.get("user_id"),
+            "message_count": len(messages),
+            "has_tools": bool(req_data.get("tools")),
+        }
+        _log("🧪 [CacheProbe] shape=" + _stable_json_dumps(shape))
+
+        # Prefix hashes: if a hash changes between adjacent turns, the prefix before that point is not stable.
+        acc = []
+        checkpoints = [1, 2, 3, 4, 6, 8, 12, 20, 40, 80]
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            # Do not print content, only length.
+            acc.append({
+                "role": role,
+                "content": content if isinstance(content, str) else _stable_json_dumps(content),
+                "tool_calls": msg.get("tool_calls"),
+                "name": msg.get("name"),
+            })
+            if i + 1 in checkpoints or i == len(messages) - 1:
+                s = _stable_json_dumps(acc)
+                _log(f"🧪 [CacheProbe] prefix_messages={i+1}, hash={_sha12(s)}, chars={len(s)}")
+
+        # Also hash the first N characters of full upstream JSON, including parameters.
+        full = _stable_json_dumps({
+            k: v for k, v in req_data.items()
+            if k not in ("api_key", "authorization")
+        })
+        for n in (2000, 4000, 8000, 16000, 32000):
+            if len(full) >= n:
+                _log(f"🧪 [CacheProbe] full_prefix_chars={n}, hash={_sha12(full[:n])}")
+        _log(f"🧪 [CacheProbe] full_chars={len(full)}, full_hash={_sha12(full)}")
+    except Exception as e:
+        try:
+            _log(f"⚠️ [CacheProbe] failed: {e}")
+        except Exception:
+            pass
+
+
 
 
 def _get_supabase():
