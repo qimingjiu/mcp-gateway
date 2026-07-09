@@ -1,27 +1,11 @@
-# 合并补丁：流式修复 + DeepSeek 缓存 Hash 诊断
+# 合并补丁 v2：修复 CacheProbe 不出现
 
-这个包是合并版，避免“部署诊断补丁时把 stream hotfix 覆盖掉”。
-
-包含：
-
-1. SSE/HTTP2 修复
-   - 删除 `connection: keep-alive`
-   - 避免 RikkaHub/Zeabur/HTTP2 链路出现 `stream was reset: PROTOCOL_ERROR`
-
-2. DeepSeek 缓存诊断
-   - 传 `user_id`
-   - 支持 `DEBUG_CACHE_HASH=true`
-   - 打印 prefix hash，不打印正文、不打印 Key
-
-3. 尾部动态注入
-   - 稳定内容在前
-   - 动态时间/向量召回/最近历史尽量靠后
+这个版本修正了上一版的问题：诊断函数定义了，但没有被调用，所以 Zeabur 搜不到 `CacheProbe`。
 
 ## 使用方式
 
-用本包里的 `gateway.py` 覆盖当前项目里的 `gateway.py`，重新部署 Zeabur。
-
-## 推荐环境变量
+1. 用本包里的 `gateway.py` 覆盖项目里的 `gateway.py`
+2. Zeabur 环境变量确认：
 
 ```env
 DEBUG_CACHE_HASH=true
@@ -38,37 +22,23 @@ USER_FACT_LIMIT=40
 USER_FACT_VALUE_CHARS=500
 ```
 
-## 怎么看日志
-
-你截图里那些：
-
-```txt
-GET /rest/v1/user_facts?select=value&key=eq.sys_config
-GET /rest/v1/reminders?...
-```
-
-不是缓存诊断日志，只是网关后台定时任务在读 Supabase。
-
-真正要找的是：
-
-```txt
-🧪 [CacheProbe] shape=...
-🧪 [CacheProbe] prefix_messages=1, hash=...
-🧪 [CacheProbe] full_prefix_chars=2000, hash=...
-```
-
-在 Zeabur 日志搜索：
+3. Redeploy
+4. 发一条消息
+5. 在运行日志里搜：
 
 ```txt
 CacheProbe
 ```
 
-或者发完消息后往聊天请求那一段附近翻。
+## 正常应该看到
 
-## 测完记得关
-
-```env
-DEBUG_CACHE_HASH=false
+```txt
+🧪 [CacheProbe] DEBUG_CACHE_HASH=true，准备打印本轮请求前缀 hash
+🧪 [CacheProbe] shape=...
+🧪 [CacheProbe] prefix_messages=1, hash=...
+🧪 [CacheProbe] full_prefix_chars=2000, hash=...
 ```
 
-或删除这个变量。
+## 测完关闭
+
+把 `DEBUG_CACHE_HASH` 改成 `false` 或删掉，避免日志太吵。
