@@ -33,6 +33,9 @@ _supabase_client = None
 _system_logs_buffer = []   # 简易日志缓存（用于 /api/logs）
 _MAX_LOGS = 200
 _pending_save_tasks = set()   # 持有后台存库 task 的强引用，防止被 GC 提前回收
+KEEPALIVE_INTERVAL_SECONDS = 15
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 
 
 def _log(msg: str):
@@ -42,6 +45,117 @@ def _log(msg: str):
     _system_logs_buffer.append(line)
     if len(_system_logs_buffer) > _MAX_LOGS:
         del _system_logs_buffer[: len(_system_logs_buffer) - _MAX_LOGS]
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = default
+    return max(min_value, min(value, max_value))
+
+
+def _sanitize_reasoning_for_request(messages):
+    for m in messages or []:
+        if m.get("role") != "assistant":
+            continue
+        if isinstance(m.get("content"), str) and "<think>" in m["content"]:
+            m["content"] = _THINK_BLOCK_RE.sub("", m["content"]).strip()
+        if not m.get("tool_calls"):
+            m.pop("reasoning_content", None)
+
+
+def _ensure_stream_usage(req_data):
+    stream_options = req_data.get("stream_options")
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+        req_data["stream_options"] = stream_options
+    stream_options["include_usage"] = True
+
+
+def _log_tool_diagnostic(req_data):
+    messages = req_data.get("messages") or []
+    tools = req_data.get("tools") or []
+    tools_count = len(tools) if isinstance(tools, list) else 0
+    assistant_tool_call_messages = 0
+    tool_result_messages = 0
+    tool_call_reasoning_present = False
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            assistant_tool_call_messages += 1
+            if bool(m.get("reasoning_content")):
+                tool_call_reasoning_present = True
+        elif role == "tool":
+            tool_result_messages += 1
+    _log(
+        "[tool-diagnostic] "
+        f"tools_count={tools_count}; "
+        f"assistant_tool_call_messages={assistant_tool_call_messages}; "
+        f"tool_result_messages={tool_result_messages}; "
+        f"tool_call_reasoning_present={str(tool_call_reasoning_present).lower()}"
+    )
+
+
+def _append_dynamic_context_to_last_user(messages, dynamic_part):
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") != "user":
+            continue
+        original = messages[i].get("content", "")
+        if isinstance(original, list):
+            messages[i]["content"] = original + [
+                {"type": "text", "text": "\n\n---\n" + dynamic_part}
+            ]
+        else:
+            messages[i]["content"] = str(original) + "\n\n---\n" + dynamic_part
+        return True
+    return False
+
+
+def _merge_tool_call_delta(tool_calls_dict, tc):
+    idx = tc.get("index", 0)
+    if idx not in tool_calls_dict:
+        tool_calls_dict[idx] = json.loads(json.dumps(tc, ensure_ascii=False))
+        return
+    existing = tool_calls_dict[idx]
+    if tc.get("id"):
+        existing["id"] = tc["id"]
+    if tc.get("type"):
+        existing["type"] = tc["type"]
+    if tc.get("function"):
+        existing.setdefault("function", {})
+        fn = tc["function"]
+        if fn.get("name"):
+            existing["function"]["name"] = fn["name"]
+        if fn.get("arguments"):
+            existing["function"].setdefault("arguments", "")
+            existing["function"]["arguments"] += fn["arguments"]
+
+
+def _cache_usage_line(usage):
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    cache_hit = int(usage.get("prompt_cache_hit_tokens") or 0)
+    cache_miss = int(usage.get("prompt_cache_miss_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    denom = cache_hit + cache_miss
+    hit_rate = (cache_hit / denom * 100) if denom else 0.0
+    return (
+        "[cache-usage] "
+        f"prompt_tokens={prompt_tokens}; "
+        f"cache_hit={cache_hit}; "
+        f"cache_miss={cache_miss}; "
+        f"hit_rate={hit_rate:.1f}%; "
+        f"completion_tokens={completion_tokens}"
+    )
 
 
 def _get_supabase():
@@ -209,17 +323,9 @@ class HostFixMiddleware:
                 user_msg = str(m.get("content", ""))
                 break
 
-        # ⚡ 缓存优化：清理历史 assistant 消息里残留的 <think>...</think> 思维链原文。
-        # 原因：
-        #  1. DeepSeek 官方要求 reasoner 模型不要把上一轮的思维链带回下一轮请求，
-        #     纯粹是浪费 token，且不影响效果。
-        #  2. 如果 rikkahub 这类前端把思维链原文存进了历史消息一起回传，
-        #     这部分内容体积大、每轮容易有细微格式差异，会拖累缓存命中率。
-        # 这里做一次防御性清理，不管前端怎么存的，转发前统一剥掉。
-        _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
-        for m in req_data.get("messages", []):
-            if m.get("role") == "assistant" and isinstance(m.get("content"), str) and "<think>" in m["content"]:
-                m["content"] = _THINK_BLOCK_RE.sub("", m["content"]).strip()
+        # 普通历史不回传思维链；但 assistant.tool_calls 里的 reasoning_content
+        # 是 DeepSeek thinking + tools 协议的一部分，必须保留给后续 tool 请求。
+        _sanitize_reasoning_for_request(req_data.get("messages", []))
 
         if sb and user_msg:
             try:
@@ -232,8 +338,10 @@ class HostFixMiddleware:
 
         # 强制流式（便于边透传边收集）
         req_data["stream"] = True
+        _ensure_stream_usage(req_data)
         if req_data.get("tools"):
             req_data["tool_choice"] = "auto"
+        _log_tool_diagnostic(req_data)
 
         # 构造请求头（修复 python-requests UA 被拦截 + 透传客户端头）
         client_headers = {k.decode("utf-8", "ignore").lower(): v.decode("utf-8", "ignore") for k, v in scope.get("headers", [])}
@@ -242,72 +350,96 @@ class HostFixMiddleware:
             "Authorization": f"Bearer {upstream_key}",
             "Content-Type": "application/json",
             "User-Agent": client_ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": client_headers.get("accept", "application/json"),
+            "Accept": "text/event-stream",
         }
         for h in ("accept-language", "x-requested-with"):
             if h in client_headers:
                 fwd_headers[h] = client_headers[h]
 
-        _log(f"➡️ [转发] POST {upstream_url} | model={req_data.get('model')} | key={upstream_key[:6]}***")
+        _log(f"➡️ [转发] POST {upstream_url} | model={req_data.get('model')}")
 
         # 启动响应流（通知客户端开始接收 SSE）
+        asgi_send_count = 0
+        client_disconnected = False
+
+        async def _send_asgi(message):
+            nonlocal asgi_send_count, client_disconnected
+            try:
+                await send(message)
+                asgi_send_count += 1
+                return True
+            except Exception:
+                client_disconnected = True
+                return False
+
         await send({
             "type": "http.response.start",
             "status": 200,
             "headers": [
                 (b"content-type", b"text/event-stream; charset=utf-8"),
-                (b"cache-control", b"no-cache"),
+                (b"cache-control", b"no-cache, no-transform"),
+                (b"x-accel-buffering", b"no"),
                 (b"access-control-allow-origin", b"*"),
             ],
         })
+        asgi_send_count += 1
 
-        # 后台线程：读取上游流，喂给队列
-        import queue
+        # 后台线程：读取上游流，喂给 asyncio.Queue；主协程只 await async_queue.get()
         import threading
-        q = queue.Queue()
+        async_queue = asyncio.Queue()
+        stream_end = object()
+        loop = asyncio.get_running_loop()
+        stream_started = time.perf_counter()
+
+        def _enqueue(item):
+            try:
+                loop.call_soon_threadsafe(async_queue.put_nowait, item)
+            except RuntimeError:
+                pass
 
         def _stream_forward():
             try:
                 with requests.post(upstream_url, headers=fwd_headers, json=req_data, stream=True, timeout=300) as resp:
                     if resp.status_code != 200:
-                        q.put({"error": f"HTTP {resp.status_code}: {resp.text[:500]}"})
-                        q.put(None)
+                        _enqueue({"error": f"HTTP {resp.status_code}: {resp.text[:500]}"})
+                        _enqueue(stream_end)
                         return
                     for line in resp.iter_lines(chunk_size=1, decode_unicode=True):
                         if line:
-                            q.put(line)
-                q.put(None)
+                            if isinstance(line, bytes):
+                                line = line.decode("utf-8", "ignore")
+                            _enqueue(line)
+                _enqueue(stream_end)
             except Exception as e:
-                q.put({"error": str(e)})
-                q.put(None)
+                _enqueue({"error": str(e)})
+                _enqueue(stream_end)
 
         threading.Thread(target=_stream_forward, daemon=True).start()
 
         collected_content = ""
         collected_reasoning = ""
         tool_calls_dict = {}
-
-        # ⚡ 修复 "stream was reset: PROTOCOL_ERROR"：
-        # 当 DeepSeek 思考链很长、中间一段时间没有任何 token 输出时，
-        # Zeabur/Cloudflare 等边缘代理会把这条 SSE 长连接判定为"空闲"，主动掐断连接。
-        # 解法：队列超过 KEEPALIVE_INTERVAL 秒没有新数据时，主动发一条 SSE 注释行(: ping)
-        # 作为心跳保活。SSE 规范里以 ":" 开头的行是注释，客户端会直接忽略，不影响正文解析。
-        KEEPALIVE_INTERVAL = 15  # 秒；比常见边缘代理的100s空闲超时短得多，留足余量
+        latest_usage = None
+        upstream_first_sse_ms = None
+        heartbeat_count = 0
+        sse_line_count = 0
+        received_done = False
 
         # 主循环：透传 + 收集
         while True:
             try:
-                chunk = await asyncio.wait_for(asyncio.to_thread(q.get), timeout=KEEPALIVE_INTERVAL)
+                chunk = await asyncio.wait_for(async_queue.get(), timeout=KEEPALIVE_INTERVAL_SECONDS)
             except asyncio.TimeoutError:
-                # 队列一直没有新数据，说明上游还在长时间思考，发个心跳防止连接被掐断
-                try:
-                    await send({"type": "http.response.body", "body": b": ping\n\n", "more_body": True})
-                except Exception:
+                heartbeat_count += 1
+                if not await _send_asgi({"type": "http.response.body", "body": b": ping\n\n", "more_body": True}):
                     break
                 continue
 
-            if chunk is None:
+            if chunk is stream_end:
                 break
+
+            if upstream_first_sse_ms is None:
+                upstream_first_sse_ms = int((time.perf_counter() - stream_started) * 1000)
 
             if isinstance(chunk, dict) and "error" in chunk:
                 _log(f"❌ 上游流式报错: {chunk['error']}")
@@ -318,34 +450,60 @@ class HostFixMiddleware:
                     "model": req_data.get("model"),
                     "choices": [{"index": 0, "delta": {"content": f"\n\n[上游错误] {chunk['error']}"}, "finish_reason": "stop"}],
                 }
-                await send({"type": "http.response.body", "body": f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode("utf-8"), "more_body": True})
+                if not await _send_asgi({"type": "http.response.body", "body": f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode("utf-8"), "more_body": True}):
+                    break
                 continue
 
-            await send({"type": "http.response.body", "body": (chunk + "\n\n").encode("utf-8"), "more_body": True})
+            if chunk == "data: [DONE]":
+                if not received_done:
+                    received_done = True
+                    sse_line_count += 1
+                    await _send_asgi({"type": "http.response.body", "body": b"data: [DONE]\n\n", "more_body": True})
+                break
+
+            if received_done:
+                continue
+
+            if not await _send_asgi({"type": "http.response.body", "body": (chunk + "\n\n").encode("utf-8"), "more_body": True}):
+                break
+            sse_line_count += 1
 
             if chunk.startswith("data: ") and chunk != "data: [DONE]":
                 try:
                     dj = json.loads(chunk[6:])
-                    if dj.get("choices"):
-                        delta = dj["choices"][0].get("delta", {})
+                    if isinstance(dj.get("usage"), dict):
+                        latest_usage = dj["usage"]
+                    choices = dj.get("choices") or []
+                    if choices:
+                        delta = choices[0].get("delta", {})
                         if delta.get("content"):
                             collected_content += delta["content"]
                         if delta.get("reasoning_content"):
                             collected_reasoning += delta["reasoning_content"]
                         if delta.get("tool_calls"):
                             for tc in delta["tool_calls"]:
-                                idx = tc.get("index", 0)
-                                if idx not in tool_calls_dict:
-                                    tool_calls_dict[idx] = tc
-                                else:
-                                    if tc.get("function", {}).get("arguments"):
-                                        tool_calls_dict[idx]["function"].setdefault("arguments", "")
-                                        tool_calls_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
+                                _merge_tool_call_delta(tool_calls_dict, tc)
                 except Exception:
                     pass
 
         # 结束响应
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        if not client_disconnected:
+            await _send_asgi({"type": "http.response.body", "body": b"", "more_body": False})
+
+        usage_line = _cache_usage_line(latest_usage)
+        if usage_line:
+            _log(usage_line)
+        total_stream_ms = int((time.perf_counter() - stream_started) * 1000)
+        _log(
+            "[stream-diagnostic] "
+            f"upstream_first_sse_ms={upstream_first_sse_ms if upstream_first_sse_ms is not None else -1}; "
+            f"heartbeat_count={heartbeat_count}; "
+            f"sse_line_count={sse_line_count}; "
+            f"asgi_send_count={asgi_send_count}; "
+            f"received_done={str(received_done).lower()}; "
+            f"client_disconnected={str(client_disconnected).lower()}; "
+            f"total_stream_ms={total_stream_ms}"
+        )
 
 
         # ==========================================
@@ -370,7 +528,7 @@ class HostFixMiddleware:
         │ 多轮对话历史  →  前端原样透传（跨轮不变，随轮增长）     │
         │   [user_1, assistant_1, user_2, assistant_2, ...]    │
         ├─────────────────────────────────────────────────────┤
-        │ 最后一条 user 消息  →  动态内容前缀 + 原始 query       │
+        │ 最后一条 user 消息  →  原始 query + 动态内容后缀       │
         │   时间 / 向量记忆 ... 仅本条不被 cache，代价最小       │
         └─────────────────────────────────────────────────────┘
 
@@ -378,21 +536,18 @@ class HostFixMiddleware:
         导致每轮只能命中 system 这 ~1.3K token。改为拼入 user content 后，
         cache 可以随对话轮数增长，长对话命中率趋近 90%+。
         """
-        ai_name = os.environ.get("AI_NAME", "助手")
         user_name = os.environ.get("USER_NAME", "用户")
         user_id = os.environ.get("USER_ID", "default")
         persona = os.environ.get("AI_PERSONA", "").strip()
         chat_tag = os.environ.get("CHAT_TAG", "Web_Chat")
+        context_started = time.perf_counter()
 
         cache_friendly = os.environ.get("CACHE_FRIENDLY_MODE", "true").strip().lower() not in ("0", "false", "no", "off")
         time_injection = os.environ.get("TIME_INJECTION", "hour" if cache_friendly else "minute").strip().lower()
         inject_silence = os.environ.get("INJECT_SILENCE_HOURS", "true").strip().lower() in ("1", "true", "yes", "on")
 
-        try:
-            history_limit = int(os.environ.get("HISTORY_LIMIT", "4"))
-        except Exception:
-            history_limit = 4
-        history_limit = max(0, min(history_limit, 20))
+        core_summary_limit = _env_int("CORE_SUMMARY_LIMIT", 1, 0, 3)
+        core_summary_chars = _env_int("CORE_SUMMARY_CHARS", 1000, 0, 6000)
 
         try:
             vector_top_k = int(os.environ.get("VECTOR_TOP_K", "3"))
@@ -465,13 +620,18 @@ class HostFixMiddleware:
         # ===== 三路并行查询，消除串行等待导致的首 token 延迟 =====
         # core_summaries、user_facts、Pinecone 向量检索同时发出，取最慢的那个为准
         async def _fetch_core_summaries():
+            if core_summary_limit <= 0:
+                return "无长期阶段总结", 0
             try:
-                sr = await asyncio.to_thread(lambda: sb.table("memories").select("content").eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute())
+                sr = await asyncio.to_thread(lambda: sb.table("memories").select("content").eq("tags", "Core_Cognition").order("created_at", desc=True).limit(core_summary_limit).execute())
                 if sr and sr.data:
-                    return "\n".join([f"- {str(s.get('content', ''))[:1200]}" for s in sr.data])
+                    lines = []
+                    for s in sr.data[:core_summary_limit]:
+                        lines.append(f"- {str(s.get('content', ''))[:core_summary_chars]}")
+                    return "\n".join(lines), len(lines)
             except Exception:
                 pass
-            return "无长期阶段总结"
+            return "无长期阶段总结", 0
 
         async def _fetch_user_prof():
             try:
@@ -489,7 +649,7 @@ class HostFixMiddleware:
 
         async def _fetch_vector():
             if vector_top_k <= 0:
-                return "无相关深层记忆"
+                return "无相关深层记忆", 0
             try:
                 import server
                 vc = getattr(server, "vector_client", None)
@@ -505,12 +665,12 @@ class HostFixMiddleware:
                             if text:
                                 chunks.append(f"- {text[:vector_memory_chars]}")
                         if chunks:
-                            return "\n".join(chunks)
+                            return "\n".join(chunks), len(chunks)
             except Exception as e:
                 _log(f"Pinecone 检索失败（跳过）: {e}")
-            return "无相关深层记忆"
+            return "无相关深层记忆", 0
 
-        core_summaries, user_prof, vector_context = await asyncio.gather(
+        (core_summaries, core_summary_count), user_prof, (vector_context, vector_result_count) = await asyncio.gather(
             _fetch_core_summaries(),
             _fetch_user_prof(),
             _fetch_vector(),
@@ -532,34 +692,6 @@ class HostFixMiddleware:
         if not has_system and req_data.get("messages") and stable_inject:
             req_data["messages"].insert(0, {"role": "system", "content": stable_inject})
 
-        history_msgs = []
-        if history_limit > 0:
-            try:
-                _TAGS = [chat_tag, "TG_MSG", "QQ_Chat", "QQ_Group", "Email_Process"]
-                fetch_limit = max(history_limit * 2, history_limit)
-                hr = await asyncio.to_thread(lambda: sb.table("memories").select("content, tags").in_("tags", _TAGS).order("created_at", desc=True).limit(fetch_limit).execute())
-                if hr and hr.data:
-                    rows = list(reversed(hr.data))[-history_limit:]
-                    for row in rows:
-                        c = str(row.get("content", "")).strip()
-                        if not c:
-                            continue
-                        if c.startswith(user_name):
-                            history_msgs.append({"role": "user", "content": (c.split("：", 1)[-1] if "：" in c else c)[:500]})
-                        elif c.startswith("我(") or c.startswith(f"我({ai_name})"):
-                            history_msgs.append({"role": "assistant", "content": (c.split("：", 1)[-1] if "：" in c else c)[:500]})
-                    merged = []
-                    for m in history_msgs:
-                        if merged and merged[-1]["role"] == m["role"]:
-                            merged[-1]["content"] += "\n" + m["content"]
-                        else:
-                            merged.append(m)
-                    history_msgs = merged
-                    while history_msgs and history_msgs[0]["role"] != "user":
-                        history_msgs.pop(0)
-            except Exception as e:
-                _log(f"拉取上文失败（跳过）: {e}")
-
         dynamic_lines = []
         if time_line:
             dynamic_lines.append(time_line)
@@ -571,7 +703,7 @@ class HostFixMiddleware:
             f"[本轮动态上下文]\n"
             f"{dynamic_header}\n"
             f"【{user_name}的核心画像 / user_facts】:\n{user_prof}\n\n"
-            f"【近3次阶段总结 / Core_Cognition】:\n{core_summaries}\n"
+            f"【近{core_summary_limit}次阶段总结 / Core_Cognition】:\n{core_summaries}\n"
             f"--- 以下为调取的历史背景记忆：这是过去的事，不是现在正在发生的事 ---\n"
             f"【深层关联记忆 / Pinecone】:\n{vector_context}\n"
             f"------------------------------------------------"
@@ -587,7 +719,7 @@ class HostFixMiddleware:
         #   Turn 3 的 index-3 是 user_2，但 Turn 2 缓存的 index-3 是 DYNAMIC_SYS → 在 index-3 就 cache miss。
         #   结果：每轮只能命中 system_stable 这 ~1.3K token，永远涨不了。
         #
-        # 正确做法：把动态内容直接拼进最后一条 user 消息的开头。
+        # 正确做法：把动态内容直接拼进最后一条 user 消息的末尾。
         # 这样 [system_stable, user_1, assistant_1, user_2, assistant_2, ...] 这段多轮历史
         # 完全不被动态内容破坏，DeepSeek 可以跨轮复用，缓存随对话轮数不断增长。
         #
@@ -600,24 +732,24 @@ class HostFixMiddleware:
         while req_data.get("messages") and req_data["messages"][-1].get("role") == "assistant":
             req_data["messages"].pop()
 
-        # 找最后一条 user 消息，把动态上下文直接前缀拼入其 content
+        # 找最后一条 user 消息，把动态上下文后缀拼入其 content
         messages = req_data.get("messages", [])
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                original = messages[i].get("content", "")
-                # 兼容多模态 content（list 格式，如带图片的消息）
-                if isinstance(original, list):
-                    messages[i]["content"] = [
-                        {"type": "text", "text": dynamic_part + "\n---\n"}
-                    ] + original
-                else:
-                    messages[i]["content"] = dynamic_part + "\n---\n" + str(original)
-                break
+        _append_dynamic_context_to_last_user(messages, dynamic_part)
 
         _log(
             f"🧠 [智能体/用户消息注入] 注入完成：画像{len(user_prof)}字 + "
             f"总结{len(core_summaries)}字 + 向量记忆{len(vector_context)}字；"
             f"time={time_injection}, vector_top_k={vector_top_k}"
+        )
+        _log(
+            "[context-diagnostic] "
+            f"context_fetch_ms={int((time.perf_counter() - context_started) * 1000)}; "
+            f"user_facts_chars={len(user_prof)}; "
+            f"core_summary_count={core_summary_count}; "
+            f"core_summary_chars={len(core_summaries)}; "
+            f"vector_result_count={vector_result_count}; "
+            f"vector_chars={len(vector_context)}; "
+            f"dynamic_chars={len(dynamic_part)}"
         )
 
 
@@ -629,8 +761,8 @@ class HostFixMiddleware:
         chat_tag = os.environ.get("CHAT_TAG", "Web_Chat")
         now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-        final_save_text = ai_msg
-        if reasoning:
+        final_save_text = ai_msg or ""
+        if reasoning and _env_bool("SAVE_REASONING_TO_MEMORY", False):
             final_save_text = f"<think>\n{reasoning}\n</think>\n\n{final_save_text}"
         if not final_save_text and tool_calls:
             tc_names = [tc.get("function", {}).get("name", "unknown") for tc in tool_calls.values()]
