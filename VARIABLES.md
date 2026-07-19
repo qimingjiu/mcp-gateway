@@ -12,7 +12,7 @@
 - [1. 基础部署](#1-基础部署)
 - [2. 数据库 (Supabase)](#2-数据库-supabase)
 - [3. 多模型 LLM](#3-多模型-llm)
-- [4. 向量记忆 (Pinecone)](#4-向量记忆-pinecone)
+- [4. 向量记忆 (Mem0 + Pinecone)](#4-向量记忆-mem0--pinecone)
 - [5. 通讯渠道](#5-通讯渠道)
 - [6. Google 集成](#6-google-集成)
 - [7. 地图 / GPS](#7-地图--gps)
@@ -30,23 +30,24 @@
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|:---:|--------|------|
-| `PORT` | ❌ | `10000` | 网关监听端口（Dockerfile `EXPOSE 10000`，云平台会自动注入） |
-| `API_SECRET` | 🔴 强烈建议 | 空 | `/api/*` `/sse` `/messages` `/v1/*` 接口的安全密钥，**留空则不强制鉴权（危险）** |
+| `PORT` | ✅ | `10000` | 网关监听端口（Dockerfile `EXPOSE 10000`） |
+| `GATEWAY_HOST` | ❌ | `localhost:8000` | 反代场景下修正的 Host 头，一般留空 |
+| `API_SECRET` | ✅ | 空 | `/api/*` 管理接口的安全密钥，防止未授权调用 |
+| `LOG_FILE` | ❌ | 空 | 日志文件路径（供 `/api/logs` 读取，留空则用平台日志） |
+| `RESTART_WEBHOOK_URL` | ❌ | 空 | 云平台重启回调 URL（供 `/api/restart` 调用） |
 
-### 1.1 🧠 智能体身份
+### 1.1 🧠 智能体身份（控制 `/v1/chat/completions` 的人格化行为）
 
-控制对话的人格化行为：`AI_NAME` / `USER_NAME` / `AI_PERSONA` 在 gateway 智能体注入、heartbeat 心跳、napcat QQ 总结等多处复用；`USER_ID` / `CHAT_TAG` / `SUMMARY_THRESHOLD` 主要影响 `/v1/chat/completions` 的存库与自动总结。
-
-> 上文注入 + 存库仅在同时配置了 `SUPABASE_URL` 时生效（否则 `/v1/*` 纯透传）。
+仅当配置了 `SUPABASE_URL` 时生效（启用上文注入 + 存库）。不配则纯透传。
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|:---:|--------|------|
 | `USER_NAME` | ❌ | `用户` | 用户称呼，注入到 system 提示与存库记录（如 `张三`） |
 | `AI_NAME` | ❌ | `助手` | AI 角色称呼，注入到 system 提示与存库记录（如 `小橘`） |
-| `USER_ID` | ❌ | `default` | 智能体模式下的用户标识（gateway.py 上文注入用，区分不同用户的对话流） |
-| `AI_PERSONA` | ❌ | `你是一个通用智能助手。` | AI 人设完整文本，会拼接到 system 提示最前面 |
-| `CHAT_TAG` | ❌ | `Web_Chat` | `/v1/chat/completions` 存库时给本轮对话打的标签（用于区分网页/TG/QQ 渠道） |
-| `SUMMARY_THRESHOLD` | ❌ | `30` | 自动总结阈值：全渠道（网页/QQ/TG/邮件）对话流水累计达到该条数时，自动调用聊天模型（`main_chat`）生成第一人称阶段总结，存入 `Core_Cognition` 并归档旧记录。依赖 `CHAT_API_KEY`。 |
+| `USER_ID` | ❌ | `default` | 用户隔离 ID（Mem0 向量记忆按此区分不同用户） |
+| `AI_PERSONA` | ❌ | 空 | AI 人设完整文本，会拼接到 system 提示最前面 |
+| `CHAT_TAG` | ❌ | `Web_Chat` | 存库时给本轮对话打的标签（用于区分网页/TG/QQ 渠道） |
+| `SUMMARY_THRESHOLD` | ❌ | `30` | 🆕 自动总结阈值：全渠道（网页/QQ/TG/邮件）对话流水累计达到该条数时，自动调用聊天模型（`main_chat`）生成第一人称阶段总结，存入 `Core_Cognition` 并归档旧记录。依赖 `CHAT_API_KEY`。 |
 
 ---
 
@@ -59,64 +60,69 @@
 | `SUPABASE_URL` | ✅ | 空 | Supabase 项目 URL，如 `https://xxxxx.supabase.co` |
 | `SUPABASE_KEY` | ✅ | 空 | Supabase service_role key（生产推荐）或 anon key |
 
-> 建表 SQL 见 [`README.md` § 数据库表结构](README.md#-数据库表结构-supabase)。
+> 建表 SQL 见 `DEPLOY_ZEABUR.md` 附录。
 
 ---
 
 ## 3. 多模型 LLM
 
-网关支持 4 类 LLM 角色：**主对话 `CHAT_*`**（必配，覆盖对话/总结/日记/`/v1/*` 代理全部场景）+ 3 类可选专用模型：**视觉 `VISION_*`**（TG 识图 + QQ OCR）、**语音识别 STT**（TG 语音转文字）、**语音合成 TTS**（TG 语音条回复）。最小化配置只需 `CHAT_*` 一组。
+网关支持 5 个 LLM 角色，用 `switch_ai_brain` 工具可热切换默认角色。最小化配置只需 `OPENAI_*`。
 
-### 3.1 主对话模型 CHAT (日常聊天 + v1 代理主力)
+### 3.1 默认 / 通用模型 (OpenAI 兼容) ⚠️ 已废弃
 
-可被数据库 `user_facts` 表 `key='llm_settings'` 的 JSON 动态覆盖（数据库配置优先于环境变量）。
+> ⚠️ **自 v2.0 起，系统不再主动调用此模型**。所有对话/总结/日记已统一改用 `main_chat`（见 3.2）。
+> 本组变量仅作**向后兼容保留**：若 `main_chat` 未配置，极少数回退逻辑（如 `_ask_llm_async` 的模型名兜底）仍会读取它。
+> **推荐：直接配置 `CHAT_*` 即可，无需配置本组。**
 
-| 变量名 | 必填 | 默认值 | 说明 |
-|--------|:---:|--------|------|
-| `CHAT_API_KEY` | 🔴 强烈建议 | 空 | 主对话模型 API Key（不配则 LLM 相关功能全部失效） |
-| `CHAT_BASE_URL` | ❌ | `https://api.minimaxi.com/v1` | 兼容任意 OpenAI 协议服务（OpenAI / DeepSeek / 通义 / 硅基流动 / 自建 vLLM） |
-| `CHAT_MODEL_NAME` | ❌ | `abab6.5s-chat` | 模型名 |
+| 变量名 | 必填 | 默认值 | 兼容别名 |
+|--------|:---:|--------|---------|
+| `OPENAI_API_KEY` | ❌ | 空 | `DEFAULT_API_KEY` |
+| `OPENAI_BASE_URL` | ❌ | 空（用官方） | `DEFAULT_BASE_URL` |
+| `OPENAI_MODEL_NAME` | ❌ | `gpt-3.5-turbo` | `DEFAULT_MODEL_NAME` |
 
-> 💡 这个模型同时服务于：MCP 工具层、心跳日记/总结、`/v1/chat/completions` 代理。配齐这 3 项即可覆盖所有纯文字场景。
+> 支持任何 OpenAI 兼容服务：OpenAI / DeepSeek / 通义千问 / 硅基流动 / 自建 vLLM。第三方需配置 `OPENAI_BASE_URL`。
 
-### 3.2 视觉模型 VISION (TG 识图 / QQ OCR)
+### 3.2 主对话模型 CHAT (日常聊天主力)
 
-TG 收到图片、QQ 收到带图消息时，调用视觉模型识别图片内容并拼到文字里给主对话模型。**必须用支持图片输入的模型**（如 `gpt-4o-mini` / `Qwen-VL`），聊天模型不支持。
+可被数据库 `user_facts` 表 `key='llm_settings'` 的 JSON 动态覆盖。
 
-| 变量名 | 必填 | 默认值 | 说明 |
-|--------|:---:|--------|------|
-| `VISION_API_KEY` | ❌ | 空 | 视觉模型 API Key（不配则识图功能跳过） |
-| `VISION_BASE_URL` | ❌ | `https://api.openai.com/v1` | 视觉模型服务地址 |
-| `VISION_MODEL_NAME` | ❌ | `gpt-4o-mini` | 视觉模型名（须支持图片输入） |
+| 变量名 | 必填 | 默认值 |
+|--------|:---:|--------|
+| `CHAT_API_KEY` | ❌ | 空 |
+| `CHAT_BASE_URL` | ❌ | `https://api.minimaxi.com/v1` |
+| `CHAT_MODEL_NAME` | ❌ | `abab6.5s-chat` |
 
-> QQ OCR 额外受 `OCR_ENABLED`（默认 `false`）/ `OCR_MAX_IMAGES`（默认 `3`）控制，见 §11。
+### 3.3 硅基流动 SILICON1 (便宜模型)
 
-### 3.3 语音 STT/TTS (TG 语音消息收发)
+| 变量名 | 必填 | 默认值 |
+|--------|:---:|--------|
+| `SILICON1_API_KEY` | ❌ | 空 |
+| `SILICON1_BASE_URL` | ❌ | `https://api.siliconflow.cn/v1` |
+| `SILICON1_MODEL_NAME` | ❌ | `Qwen/Qwen2.5-7B-Instruct` |
 
-TG 收到语音消息时：先用 STT 转文字 → 当普通文字处理 → 回复再用 TTS 合成语音条发回。
+### 3.4 视觉模型 VISION (图片识别 / OCR)
 
-| 变量名 | 必填 | 默认值 | 说明 |
-|--------|:---:|--------|------|
-| `SILICONFLOW_API_KEY` | ❌ | 空 | STT 用的 API Key（复用 §3.4 的硅基流动 key） |
-| `STT_BASE_URL` | ❌ | `https://api.siliconflow.cn/v1` | STT 服务地址 |
-| `STT_MODEL` | ❌ | `FunAudioLLM/SenseVoiceSmall` | 语音转文字模型 |
-| `TTS_API_KEY` | ❌ | 空 | TTS 合成 API Key（不配则语音回复降级为纯文字） |
-| `TTS_BASE_URL` | ❌ | `https://api.openai.com/v1` | TTS 服务地址 |
-| `TTS_MODEL` | ❌ | `tts-1` | 语音合成模型 |
-| `TTS_VOICE` | ❌ | `echo` | 音色 ID |
+| 变量名 | 必填 | 默认值 |
+|--------|:---:|--------|
+| `VISION_API_KEY` | ❌ | 空 |
+| `VISION_BASE_URL` | ❌ | 空 |
+| `VISION_MODEL_NAME` | ❌ | `gpt-4o-mini` |
 
-> 💡 TTS 合成语音条还需 `imageio-ffmpeg`（已列入 requirements.txt，可选）用于 mp3→ogg 转码；不装则自动降级为发文字。
+### 3.5 语音模型 VOICE (STT 语音转文字)
 
-### 3.4 向量嵌入 (SiliconFlow 硅基流动)
+| 变量名 | 必填 | 默认值 |
+|--------|:---:|--------|
+| `VOICE_API_KEY` | ❌ | 回退到 `OPENAI_API_KEY` |
+| `VOICE_BASE_URL` | ❌ | `https://api.openai.com/v1` |
 
-> ⚠️ 实际请求的是硅基流动 (SiliconFlow) 的 `embeddings` 接口，**不是火山引擎 Doubao**。`DOUBAO_EMBEDDING_EP` 仅作嵌入模型名变量保留。
+### 3.6 向量嵌入 (Doubao / 硅基流动)
 
-| 变量名 | 必填 | 默认值 | 说明 |
-|--------|:---:|--------|------|
-| `SILICONFLOW_API_KEY` | ❌ | 空 | 硅基流动 API Key |
-| `DOUBAO_EMBEDDING_EP` | ❌ | 空 | 嵌入模型名，如 `BAAI/bge-m3` |
+| 变量名 | 必填 | 默认值 |
+|--------|:---:|--------|
+| `DOUBAO_API_KEY` | ❌ | 空 |
+| `DOUBAO_EMBEDDING_EP` | ❌ | 空（如 `BAAI/bge-m3`） |
 
-### 3.5 AI 人设
+### 3.7 AI 人设
 
 | 变量名 | 必填 | 默认值 |
 |--------|:---:|--------|
@@ -124,15 +130,16 @@ TG 收到语音消息时：先用 STT 转文字 → 当普通文字处理 → �
 
 ---
 
-## 4. 向量记忆 (Pinecone)
+## 4. 向量记忆 (Mem0 + Pinecone)
 
-长期语义记忆统一走 Pinecone：写入时用 SiliconFlow embedding（见 §3.4）向量化后 upsert，检索时同样向量化后做 top_k 近邻查询。需同时配置 `PINECONE_API_KEY` + `SILICONFLOW_API_KEY` + `DOUBAO_EMBEDDING_EP`。
+启用后，记忆会在 Mem0（主）和 Pinecone（兜底）双写，保证不丢，并支持语义检索。
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|:---:|--------|------|
-| `PINECONE_API_KEY` | ❌ | 空 | Pinecone 向量库 API Key |
+| `MEM0_API_KEY` | ❌ | 空 | Mem0 云服务 Token |
+| `MEM0_USER_ID` | ❌ | `default` | 用户隔离 ID（区分不同用户记忆） |
+| `PINECONE_API_KEY` | ❌ | 空 | Pinecone 向量库 Key（兜底） |
 | `PINECONE_INDEX_NAME` | ❌ | `notion-brain-v2` | Pinecone 索引名 |
-| `PINECONE_USER_ID` | ❌ | `default` | 写入 Pinecone metadata 的用户隔离 ID |
 
 ---
 
@@ -144,6 +151,7 @@ TG 收到语音消息时：先用 STT 转文字 → 当普通文字处理 → �
 |--------|:---:|--------|------|
 | `TG_BOT_TOKEN` | ❌ | 空 | Telegram Bot Token |
 | `TG_CHAT_ID` | ❌ | 空 | 默认推送目标（私聊 ID） |
+| `TG_GROUP_ID` | ❌ | 空 | 群组 ID（可选） |
 
 ### 5.2 邮件 (Resend)
 
@@ -187,6 +195,8 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 | `REPLICATE_API_KEY` | ❌ | 空 | Replicate 官方 Token |
 | `MUSIC_MODEL_VERSION` | ❌ | 空 | 原创音乐模型 version hash |
 | `VOICE_MODEL_VERSION` | ❌ | 空 | RVC 翻唱音色模型 version hash |
+| `MUSIC_API_KEY` | ❌ | 空 | 其他音乐生成服务 Key（可选） |
+| `MUSIC_API_URL` | ❌ | 空 | 其他音乐生成服务地址（可选） |
 
 ### 8.2 HTML 转图片 (HCTI)
 
@@ -221,22 +231,20 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 
 ## 11. NapCat QQ 接入
 
-通过 [NapCat](https://github.com/NapNeko/NapCatQQ) 协议接入 QQ。本网关在 `/qq-ws` 暴露**反向 WS 端点**，等待本地 NapCat 主动连接。
+通过 [NapCat](https://github.com/NapNeko/NapCatQQ) 协议实现 QQ 机器人。
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|:---:|--------|------|
-| `NAPCAT_WS_URL` | ❌ | 空 | NapCat WS 地址（仅供状态查询展示；实际接入走 `/qq-ws` 反向 WS） |
-| `NAPCAT_HTTP_URL` | ❌ | 空 | NapCat HTTP 回调地址（供掉线通知等主动调用使用） |
-| `NAPCAT_BOT_QQ` | ❌ | 空 | 机器人 QQ 号（用于群消息 @ 识别） |
+| `NAPCAT_WS_URL` | ❌ | 空 | 正向 WS 地址（如 `ws://host:3001`） |
+| `NAPCAT_HTTP_URL` | ❌ | 空 | HTTP 回调地址 |
+| `NAPCAT_BOT_QQ` | ❌ | 空 | 机器人 QQ 号 |
 | `NAPCAT_TARGET_USER` | ❌ | 空 | 限定响应的私聊用户 QQ（留空则所有人可聊） |
-| `NAPCAT_NOTIFY_QQ` | ❌ | 空 | 掉线通知接收 QQ，多个用逗号分隔（通过 `NAPCAT_HTTP_URL` 发送） |
-| `NAPCAT_NOTIFY_TG` | ❌ | 空 | 掉线时同时通知的 Telegram chat_id 列表，逗号分隔（依赖 `TG_BOT_TOKEN`） |
-| `NAPCAT_ALLOWED_GROUPS` | ❌ | 空 | 允许响应的群号，逗号分隔（留空则不响应任何群） |
+| `NAPCAT_NOTIFY_QQ` | ❌ | 空 | 掉线通知 QQ，多个用逗号分隔 |
+| `NAPCAT_NOTIFY_TG` | ❌ | 空 | 掉线同时通知 TG（`true`/`false`） |
+| `NAPCAT_ALLOWED_GROUPS` | ❌ | 空 | 允许响应的群号，逗号分隔 |
 | `NAPCAT_RECONNECT_DELAY` | ❌ | `5` | 重连初始延迟（秒） |
 | `NAPCAT_BACKOFF_FACTOR` | ❌ | `1.5` | 退避乘数 |
 | `NAPCAT_MAX_DELAY` | ❌ | `60` | 最大重连延迟（秒） |
-| `OCR_ENABLED` | ❌ | `false` | 📷 QQ 收到带图消息时是否自动 OCR 识图（依赖 `VISION_API_KEY`） |
-| `OCR_MAX_IMAGES` | ❌ | `3` | 单条消息最多识别的图片数 |
 
 ---
 
@@ -250,9 +258,8 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 | `SUMMARIZE_INTERVAL` | ❌ | `1800` | 消息总结间隔（秒） |
 | `SCHEDULE_MORNING_TIME` | ❌ | `07:30` | 日程早播时间 |
 | `SCHEDULE_EVENING_TIME` | ❌ | `22:00` | 日程晚播时间 |
-| `DIARY_TIME` | ❌ | `03:00` | 每日日记生成时间（24小时制）。到点自动拉取昨日全部对话流水，调用聊天模型（`main_chat`）生成第一人称"昨日回溯"日记，存入 Core_Cognition。启动时若发现昨日日记缺失会自动补写。依赖 `CHAT_API_KEY`。 |
-
-> 💡 环境变量热同步：`heartbeat.py` 每 10 秒从数据库 `user_facts.sys_config` 读取一批键，热更新到 `os.environ`。默认同步的键见 `async_env_sync` 源码；可用 `SYNC_KEYS`（见第 13 节）追加。
+| `DIARY_TIME` | ❌ | `03:00` | 🆕 每日日记生成时间（24小时制）。到点自动拉取昨日全部对话流水，调用聊天模型（`main_chat`）生成第一人称"昨日回溯"日记，存入 Core_Cognition。启动时若发现昨日日记缺失会自动补写。依赖 CHAT_API_KEY。 |
+| `SYNC_KEYS` | ❌ | 空 | 额外热同步的环境变量键，逗号分隔 |
 
 ---
 
@@ -260,9 +267,17 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|:---:|--------|------|
-| `SYNC_KEYS` | ❌ | 空 | 除默认热同步键外，额外需要从数据库 `sys_config` 同步的环境变量键，逗号分隔（见第 12 节） |
-
-> 📌 本仓库代码实际读取的全部环境变量均已收录在本文档第 1~12 节。如果某教程提到本节以外、上文未列出的变量（如 `MUTE_*`、`MINIMAX_*`、`ZEABUR_*` 等），均属历史遗留，当前代码未实现。
+| `MUTE_KEYWORDS` | ❌ | 空 | 触发静音的关键词，逗号分隔 |
+| `MUTE_DURATION` | ❌ | `300` | 静音持续秒数 |
+| `OCR_ENABLED` | ❌ | `false` | 是否开启 QQ 图片 OCR |
+| `OCR_MAX_IMAGES` | ❌ | `3` | 单次最多识别图片数 |
+| `SILICON_API_KEY` | ❌ | 空 | STT 语音识别 Key（硅基流动） |
+| `SILICON_STT_BASE_URL` | ❌ | 空 | STT 服务地址 |
+| `SILICON_STT_MODEL` | ❌ | 空 | STT 模型名 |
+| `MINIMAX_API_KEY` | ❌ | 空 | Minimax TTS 文字转语音 Key |
+| `ZEABUR_API_KEY` | ❌ | 空 | Zeabur 平台 API Token（API 触发重启） |
+| `NAPCAT_PROJECT_ID` | ❌ | 空 | Zeabur 项目 ID |
+| `NAPCAT_SERVICE_ID` | ❌ | 空 | Zeabur 服务 ID |
 
 ---
 
@@ -271,12 +286,12 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 只配置以下 3 项，网关即可正常启动并提供基础 MCP 工具：
 
 ```env
-# 必填：基础 + 主对话模型（这一组覆盖 MCP 工具/心跳/日记/v1 代理 全部场景）
+# 必填：基础 + LLM（主对话模型 CHAT_*）
 PORT=10000
 API_SECRET=请改成你的随机密钥
 CHAT_API_KEY=sk-xxxxxxxx
-CHAT_BASE_URL=https://api.minimaxi.com/v1   # 用 OpenAI/DeepSeek/通义/硅基流动时改成对应地址
 CHAT_MODEL_NAME=abab6.5s-chat
+# 注：OPENAI_* 已废弃，所有对话/总结统一用 CHAT_*，无需配置
 
 # 可选但推荐：数据库 + 推送
 SUPABASE_URL=https://xxxxx.supabase.co
@@ -290,9 +305,10 @@ AI_PERSONA=你是一个通用智能助手。
 
 ---
 
-## 变量生效方式
+## 变量生效与热更新
 
-- **启动时读取**：所有变量在网关启动时读取。修改后需重启进程（或在云平台重新部署）才完整生效。
-- **运行时热更新**：`heartbeat.py` 的 `async_env_sync` 协程每 10 秒从数据库 `user_facts.sys_config`（JSON）读取一批键，热写入 `os.environ`，无需重启即可即时生效（主要供 AI 人设、推送目标等高频调整项使用）。
+- **启动时读取**：所有变量在网关启动时读取并缓存在内存中。
+- **热更新**：通过 `POST /api/config` 接口可热更新部分变量（需 `API_SECRET` 鉴权），无需重启。
+- **重启生效**：修改变量后，调用 `POST /api/restart` 或在云平台重新部署即可完整生效。
 
-> 📚 部署细节请参考 [DEPLOY_ZEABUR_新手版.md](DEPLOY_ZEABUR_新手版.md)，项目总览请参考 [README.md](README.md)。
+> 📚 部署细节请参考 [DEPLOY_ZEABUR.md](DEPLOY_ZEABUR.md)，项目总览请参考 [README.md](README.md)。

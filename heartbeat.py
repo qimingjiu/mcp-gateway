@@ -18,18 +18,13 @@ import os
 import re
 import json
 import time
-import base64
 import random
 import asyncio
 import datetime
 import threading
 
-
-async def _sleep_to_next_minute():
-    """休眠到下一个整分钟（按 UTC 秒数对齐）。供多个巡视协程复用。"""
-    now = datetime.datetime.utcnow()
-    sleep_sec = 60 - now.second + 1
-    await asyncio.sleep(sleep_sec)
+# 全局：下一次主动唤醒的时间戳，可供前端展示
+global_next_wake_time = 0.0
 
 
 # ==========================================
@@ -45,6 +40,7 @@ async def async_autonomous_life():
         get_latest_diary, where_is_user, supabase
     )
 
+    global global_next_wake_time
     print("💓 自主生命循环已上线...")
 
     # 触发间隔（秒），默认 2 小时，可通过环境变量调整
@@ -53,6 +49,8 @@ async def async_autonomous_life():
     while True:
         # 随机化下一次唤醒时间，避免过于机械
         wake_jitter = random.randint(-600, 600)
+        global_next_wake_time = time.time() + interval + wake_jitter
+
         await asyncio.sleep(interval + wake_jitter)
 
         try:
@@ -264,7 +262,7 @@ async def async_diary_worker():
     - 每天到 DIARY_TIME（默认凌晨3点）自动触发
     - 与主动问候循环解耦，互不干扰
     """
-    from server import supabase, _get_now_bj
+    from server import supabase
 
     print("📔 每日日记生成神经已上线...")
     diary_time = os.environ.get("DIARY_TIME", "03:00")
@@ -273,7 +271,7 @@ async def async_diary_worker():
     # 启动时补写昨日日记（如果还没写过）
     try:
         if supabase:
-            now_bj = _get_now_bj()
+            now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
             yesterday = (now_bj - datetime.timedelta(days=1)).date()
             target_title = f"📅 昨日回溯: {yesterday}"
             def _check_diary():
@@ -288,7 +286,7 @@ async def async_diary_worker():
 
     while True:
         try:
-            now_bj = _get_now_bj()
+            now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
             current_hm = now_bj.strftime("%H:%M")
             current_date = now_bj.strftime("%Y-%m-%d")
 
@@ -300,156 +298,21 @@ async def async_diary_worker():
             print(f"❌ 日记生成器报错: {e}")
 
         # 对齐到下一分钟
-        await _sleep_to_next_minute()
+        now = datetime.datetime.utcnow()
+        sleep_sec = 60 - now.second + 1
+        await asyncio.sleep(sleep_sec)
 
 
 # ==========================================
 # 2. Telegram 消息轮询
 # ==========================================
 
-def _tg_get_file_url(token, file_id):
-    """通过 getFile 接口换取 TG 文件的下载直链，失败返回 None。"""
-    import requests
-    try:
-        info = requests.get(f"https://api.telegram.org/bot{token}/getFile?file_id={file_id}", timeout=10).json()
-        if info.get("ok"):
-            return f"https://api.telegram.org/file/bot{token}/{info['result']['file_path']}"
-    except Exception as e:
-        print(f"❌ TG getFile 失败: {e}")
-    return None
-
-
-async def _tg_recognize_photo(token, photo_list, caption):
-    """下载 TG 图片并调用 VISION 模型识别，返回拼好的描述文本（失败返回空串）。"""
-    import requests
-    from openai import OpenAI
-    vision_key = os.environ.get("VISION_API_KEY", "").strip()
-    if not vision_key or not photo_list:
-        return ""
-    try:
-        def _process():
-            file_id = photo_list[-1].get("file_id")  # 取分辨率最高的那张
-            img_url = _tg_get_file_url(token, file_id)
-            if not img_url:
-                return ""
-            img_data = requests.get(img_url, timeout=20).content
-            b64 = base64.b64encode(img_data).decode("utf-8")
-            b64_url = f"data:image/jpeg;base64,{b64}"
-            client = OpenAI(
-                api_key=vision_key,
-                base_url=os.environ.get("VISION_BASE_URL", "https://api.openai.com/v1").strip()
-            )
-            model = os.environ.get("VISION_MODEL_NAME", "gpt-4o-mini").strip()
-            prompt = (f"请详细客观地描述这张图片的内容。用户附了一句话：【{caption}】。"
-                      f"请结合画面解答这句话。图中有文字请提取。") if caption else \
-                     "请详细描述这张图片里有什么？如果是梗图/表情包请说明含义。"
-            res = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": b64_url}}
-                ]}],
-                max_tokens=600,
-            )
-            desc = res.choices[0].message.content.strip()
-            return f"[发送了一张图片]\n配文: {caption}\n识图结果: {desc}" if caption else f"[发送了一张图片]\n识图结果: {desc}"
-        return await asyncio.to_thread(_process)
-    except Exception as e:
-        print(f"❌ TG 识图失败: {e}")
-        return ""
-
-
-async def _tg_transcribe_voice(token, voice_msg):
-    """下载 TG 语音并调用 STT 模型转文字，返回识别文本（失败返回空串）。"""
-    import requests
-    import tempfile
-    from openai import OpenAI
-    stt_key = os.environ.get("SILICONFLOW_API_KEY", "").strip()  # 复用硅基流动 key
-    if not stt_key or not voice_msg:
-        return ""
-    try:
-        def _process():
-            file_id = voice_msg.get("file_id")
-            audio_url = _tg_get_file_url(token, file_id)
-            if not audio_url:
-                return ""
-            audio_data = requests.get(audio_url, timeout=20).content
-            client = OpenAI(
-                api_key=stt_key,
-                base_url=os.environ.get("STT_BASE_URL", "https://api.siliconflow.cn/v1").strip()
-            )
-            model = os.environ.get("STT_MODEL", "FunAudioLLM/SenseVoiceSmall").strip()
-            # 用临时文件承载音频（OpenAI SDK 要求 file-like 对象）
-            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-                tmp.write(audio_data)
-                tmp_path = tmp.name
-            try:
-                with open(tmp_path, "rb") as f:
-                    res = client.audio.transcriptions.create(model=model, file=f)
-            finally:
-                os.remove(tmp_path)
-            return re.sub(r'[\U00010000-\U0010ffff]', '', res.text).strip()  # 去 emoji
-        return await asyncio.to_thread(_process)
-    except Exception as e:
-        print(f"❌ TG 语音识别失败: {e}")
-        return ""
-
-
-async def _tg_tts_and_send(token, chat_id, text):
-    """把文字合成语音并用 sendVoice 发回 TG（语音消息专用回复通道）。"""
-    import requests
-    import subprocess
-    import tempfile
-    tts_key = os.environ.get("TTS_API_KEY", "").strip()
-    if not tts_key or not text:
-        return
-    try:
-        def _send():
-            from openai import OpenAI
-            tmp_mp3 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
-            tmp_ogg = tmp_mp3[:-4] + ".ogg"
-            try:
-                client = OpenAI(
-                    api_key=tts_key,
-                    base_url=os.environ.get("TTS_BASE_URL", "https://api.openai.com/v1").strip()
-                )
-                tts_res = client.audio.speech.create(
-                    model=os.environ.get("TTS_MODEL", "tts-1").strip(),
-                    voice=os.environ.get("TTS_VOICE", "echo").strip(),
-                    input=text[:1200],
-                )
-                with open(tmp_mp3, "wb") as f:
-                    f.write(tts_res.content)
-                # mp3 → ogg(opus)，TG 语音条必须是 ogg
-                try:
-                    import imageio_ffmpeg
-                    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-                except ImportError:
-                    print("❌ 缺少 imageio-ffmpeg，无法转 ogg 语音条；改发文字。")
-                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                                  json={"chat_id": chat_id, "text": text}, timeout=15)
-                    return
-                subprocess.run([ffmpeg, "-y", "-i", tmp_mp3, "-c:a", "libopus", "-b:a", "32k", tmp_ogg],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if os.path.exists(tmp_ogg):
-                    with open(tmp_ogg, "rb") as f:
-                        requests.post(f"https://api.telegram.org/bot{token}/sendVoice",
-                                      data={"chat_id": chat_id}, files={"voice": f}, timeout=30)
-            finally:
-                for p in (tmp_mp3, tmp_ogg):
-                    if os.path.exists(p):
-                        os.remove(p)
-        await asyncio.to_thread(_send)
-    except Exception as e:
-        print(f"❌ TTS 合成发送失败: {e}")
-
-
 async def async_telegram_polling():
     """轮询 Telegram Bot 的 getUpdates 接口，接收并处理用户消息。"""
     from server import (
         _get_llm_client, _ask_llm_async, _push_wechat,
         _save_memory_to_db, _get_current_persona,
-        get_latest_diary, where_is_user, vector_client
+        get_latest_diary, where_is_user, mem0_client
     )
 
     import requests
@@ -484,17 +347,11 @@ async def async_telegram_polling():
                     continue
 
                 chat_id = message.get("chat", {}).get("id")
-                if not chat_id:
+                text = message.get("text", "").strip()
+                if not chat_id or not text:
                     continue
 
-                # 合并文字：纯文本消息取 text，图片消息的配文在 caption
-                text = message.get("text", "") or message.get("caption", "")
-                text = text.strip()
-                photo = message.get("photo", [])
-                voice = message.get("voice", {})
-                is_voice_msg = False
-
-                # 简单的指令拦截（仅对纯文本指令生效）
+                # 简单的指令拦截
                 if text.startswith("/"):
                     await asyncio.to_thread(
                         lambda: requests.post(
@@ -505,28 +362,6 @@ async def async_telegram_polling():
                     )
                     continue
 
-                # 📸 图片识别：下载图片 → VISION 模型识图 → 把描述拼进 text
-                if photo:
-                    print("📸 [TG] 收到图片，正在识图...")
-                    desc = await _tg_recognize_photo(token, photo, text)
-                    if desc:
-                        text = desc
-                    else:
-                        text = "[发送了一张图片，但识图失败]"
-
-                # 🎤 语音识别：下载语音 → STT 转文字 → 当作普通文字处理
-                if voice:
-                    print("🎤 [TG] 收到语音，正在转文字...")
-                    stt_text = await _tg_transcribe_voice(token, voice)
-                    if stt_text:
-                        text = stt_text
-                        is_voice_msg = True
-                    else:
-                        text = "[发送了一段语音，但识别失败]"
-
-                if not text:
-                    continue
-
                 # 调用 LLM 生成回复
                 client = _get_llm_client("main_chat")
                 if client:
@@ -535,46 +370,39 @@ async def async_telegram_polling():
                         curr_loc = await where_is_user()
                         curr_persona = _get_current_persona()
 
-                        # 语音消息：提示 AI 回复更像口语
-                        voice_addon = "⚠️ 对方发的是语音！你的回复请更像真人口语，简短温柔，不要像念课文。" if is_voice_msg else ""
                         prompt = f"""
                         用户发来消息: {text}
                         当前人设: {curr_persona}
                         近期记录: {recent_mem}
-                        {voice_addon}
 
                         请用符合人设的口吻回复用户。纯文本，自然真诚。
                         """
                         reply = await _ask_llm_async(client, prompt, temperature=0.8)
 
                         if reply:
-                            # 语音消息 → 用 TTS 合成语音条发回；普通消息 → 发文字
-                            if is_voice_msg:
-                                await _tg_tts_and_send(token, chat_id, reply)
-                            else:
-                                await asyncio.to_thread(
-                                    lambda: requests.post(
-                                        f"{base_url}/sendMessage",
-                                        json={"chat_id": chat_id, "text": reply},
-                                        timeout=15
-                                    )
+                            await asyncio.to_thread(
+                                lambda: requests.post(
+                                    f"{base_url}/sendMessage",
+                                    json={"chat_id": chat_id, "text": reply},
+                                    timeout=15
                                 )
+                            )
                             await asyncio.to_thread(
                                 _save_memory_to_db, "🤖 互动记录",
                                 f"用户: {text}\n回复: {reply}", "流水", "温柔", "TG_MSG"
                             )
 
-                            # 写入 Pinecone 向量长期记忆
-                            if vector_client:
+                            # 写入 Mem0 长期记忆
+                            if mem0_client:
                                 try:
-                                    def _add_vec():
-                                        vector_client.add([
+                                    def _add_mem0():
+                                        mem0_client.add([
                                             {"role": "user", "content": text},
                                             {"role": "assistant", "content": reply}
-                                        ], user_id=os.environ.get("PINECONE_USER_ID", "default"))
-                                    await asyncio.to_thread(_add_vec)
+                                        ], user_id=os.environ.get("MEM0_USER_ID", "default"))
+                                    await asyncio.to_thread(_add_mem0)
                                 except Exception as e:
-                                    print(f"Pinecone 写入报错: {e}")
+                                    print(f"Mem0 写入报错: {e}")
                     except Exception as e:
                         print(f"❌ TG 回复生成失败: {e}")
         except Exception as e:
@@ -717,7 +545,9 @@ async def async_reminder_worker():
             pass
 
         # 对齐到下一分钟
-        await _sleep_to_next_minute()
+        now = datetime.datetime.utcnow()
+        sleep_sec = 60 - now.second + 1
+        await asyncio.sleep(sleep_sec)
 
 
 # ==========================================
@@ -726,7 +556,7 @@ async def async_reminder_worker():
 
 async def async_schedule_secretary():
     """每日早晚播报 Google 日历日程。"""
-    from server import _get_calendar_service, _push_wechat, TARGET_CALENDAR_ID, _get_now_bj
+    from server import _get_calendar_service, _push_wechat, TARGET_CALENDAR_ID
 
     print("📅 日程小秘书已上线...")
     if not os.environ.get("GOOGLE_USER_TOKEN_JSON"):
@@ -739,7 +569,7 @@ async def async_schedule_secretary():
 
     while True:
         try:
-            now_bj = _get_now_bj()
+            now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
             current_hm = now_bj.strftime("%H:%M")
 
             if current_hm == morning_time:
@@ -750,7 +580,9 @@ async def async_schedule_secretary():
         except Exception as e:
             print(f"❌ 日程小秘书报错: {e}")
 
-        await _sleep_to_next_minute()
+        now = datetime.datetime.utcnow()
+        sleep_sec = 60 - now.second + 1
+        await asyncio.sleep(sleep_sec)
 
 
 async def _broadcast_schedule(target_date, label, _get_calendar_service, _push_wechat, calendar_id, is_morning=True):
@@ -846,11 +678,11 @@ async def async_env_sync():
 
     print("⚙️ 环境变量热同步神经已上线...")
     # 支持热同步的键列表 (可通过环境变量扩展)
-    # 仅保留代码真实读取的键；如需追加，用 SYNC_KEYS 环境变量配置
     default_sync_keys = [
-        "CHAT_API_KEY", "CHAT_BASE_URL", "CHAT_MODEL_NAME",
+        "DEFAULT_API_KEY", "DEFAULT_BASE_URL", "DEFAULT_MODEL_NAME",
         "TG_BOT_TOKEN", "TG_CHAT_ID",
-        "AI_PERSONA", "PINECONE_USER_ID",
+        "EMAIL_API_KEY", "EMAIL_FROM", "ADMIN_EMAIL",
+        "AI_PERSONA", "MEM0_USER_ID",
     ]
     extra_keys = [k.strip() for k in os.environ.get("SYNC_KEYS", "").split(",") if k.strip()]
     sync_keys = list(set(default_sync_keys + extra_keys))

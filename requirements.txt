@@ -13,7 +13,8 @@ supabase
 # LLM SDK
 openai
 
-# Vector Memory (Pinecone)
+# Vector Memory (Mem0 + Pinecone dual-write)
+mem0ai
 pinecone
 
 # Web Search
@@ -27,6 +28,3 @@ google-api-python-client
 
 # Multimedia (AI Music / Cover, optional)
 replicate
-
-# Audio (TG 语音条 TTS 回复所需，可选 — 不装则语音回复降级为文字)
-imageio-ffmpeg

@@ -8,13 +8,13 @@
 - 暴露一组管理 / 健康检查 / 配置接口
 - 🧠 OpenAI 兼容代理 (/v1/chat/completions, /v1/models)：
     * 支持纯透传模式（无 Supabase 时）
-    * 支持智能体模式（配了 Supabase + 可选 Pinecone 向量记忆）：
+    * 支持智能体模式（配了 Supabase + 可选 Mem0）：
       自动注入上文（最近N条对话）、人设、用户画像、阶段总结、向量记忆
     * 流式收集 → 异步双写存库（不阻塞响应）
 - 将业务请求转发给下游 MCP 应用
 
 所有配置从环境变量读取，全部"个人化内容"已变量化，无任何硬编码。
-未配置的功能会优雅降级，保证最小配置（仅 CHAT_API_KEY）即可运行。
+未配置的功能会优雅降级，保证最小配置（仅 OPENAI_API_KEY）即可运行。
 """
 
 import os
@@ -24,14 +24,13 @@ import time
 import datetime
 import requests
 
-
 # ==========================================
 # 全局连接（延迟初始化，避免启动时无 Supabase 就崩）
 # ==========================================
 _supabase_client = None
+_mem0_client = None
 _system_logs_buffer = []   # 简易日志缓存（用于 /api/logs）
 _MAX_LOGS = 200
-_pending_save_tasks = set()   # 持有后台存库 task 的强引用，防止被 GC 提前回收
 
 
 def _log(msg: str):
@@ -44,19 +43,10 @@ def _log(msg: str):
 
 
 def _get_supabase():
-    """获取 Supabase 客户端（复用 server.py 已初始化的实例，避免重复建连）"""
+    """惰性初始化 Supabase 客户端，没配 URL/KEY 就返回 None"""
     global _supabase_client
     if _supabase_client is not None:
         return _supabase_client
-    try:
-        import server
-        if getattr(server, "supabase", None) is not None:
-            _supabase_client = server.supabase
-            _log(f"✅ 复用 server.py 的 Supabase 客户端: {(os.environ.get('SUPABASE_URL') or '')[:30]}...")
-            return _supabase_client
-    except Exception as e:
-        _log(f"⚠️ 复用 server.supabase 失败，回退到自建: {e}")
-    # 回退：本模块自建（仅在 server.py 未成功初始化时）
     url = os.environ.get("SUPABASE_URL", "").strip()
     key = os.environ.get("SUPABASE_KEY", "").strip()
     if not url or not key:
@@ -64,11 +54,30 @@ def _get_supabase():
     try:
         from supabase import create_client
         _supabase_client = create_client(url, key)
-        _log(f"✅ Supabase 已连接(自建): {url[:30]}...")
+        _log(f"✅ Supabase 已连接: {url[:30]}...")
     except Exception as e:
         _log(f"❌ Supabase 连接失败: {e}")
         _supabase_client = None
     return _supabase_client
+
+
+def _get_mem0():
+    """惰性初始化 Mem0 客户端，没配 API_KEY 就返回 None"""
+    global _mem0_client
+    if _mem0_client is not None:
+        return _mem0_client
+    api_key = os.environ.get("MEM0_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        from mem0 import Memory
+        _mem0_client = Memory.from_config({"vector_store": {"provider": "mem0", "config": {"api_key": api_key}}}) \
+            if False else Memory()   # 兼容 mem0ai 新旧版本
+        _log("✅ Mem0 已初始化")
+    except Exception as e:
+        _log(f"❌ Mem0 初始化失败（将跳过向量记忆）: {e}")
+        _mem0_client = None
+    return _mem0_client
 
 
 class HostFixMiddleware:
@@ -151,8 +160,12 @@ class HostFixMiddleware:
 
         # ---- /v1/models ----
         if path == "/v1/models" and method == "GET":
-            default_model = os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
+            default_model = os.environ.get("OPENAI_MODEL_NAME", "gpt-3.5-turbo")
             models = [{"id": default_model, "object": "model", "created": int(time.time()), "owned_by": "mcp-gateway"}]
+            for prefix in ("CHAT_", "SILICON1_", "VISION_", "VOICE_"):
+                mn = os.environ.get(f"{prefix}MODEL_NAME", "").strip()
+                if mn and mn != default_model:
+                    models.append({"id": mn, "object": "model", "created": int(time.time()), "owned_by": "mcp-gateway"})
             await _send_json_resp(send, 200, {"object": "list", "data": models})
             return
 
@@ -179,13 +192,13 @@ class HostFixMiddleware:
             await _send_json_resp(send, 400, {"error": {"message": "Invalid JSON body"}})
             return
 
-        # 解析上游配置：统一用 CHAT_*（主对话模型），与 MCP 工具层一致
-        upstream_base = os.environ.get("CHAT_BASE_URL", "https://api.minimaxi.com/v1").strip()
-        upstream_key = os.environ.get("CHAT_API_KEY", "").strip()
-        default_model = os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
+        # 解析上游配置（统一用 OPENAI_*，兼容旧 CHAT_*）
+        upstream_base = os.environ.get("OPENAI_BASE_URL", os.environ.get("CHAT_BASE_URL", os.environ.get("DEFAULT_BASE_URL", ""))).strip()
+        upstream_key = os.environ.get("OPENAI_API_KEY", os.environ.get("CHAT_API_KEY", os.environ.get("DEFAULT_API_KEY", ""))).strip()
+        default_model = os.environ.get("OPENAI_MODEL_NAME", os.environ.get("CHAT_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "gpt-3.5-turbo")))
 
         if not upstream_key:
-            await _send_json_resp(send, 500, {"error": {"message": "Server 未配置 CHAT_API_KEY"}})
+            await _send_json_resp(send, 500, {"error": {"message": "Server 未配置 OPENAI_API_KEY"}})
             return
 
         if not req_data.get("model"):
@@ -321,15 +334,10 @@ class HostFixMiddleware:
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
         # ==========================================
-        # 💾 异步写入：把本轮对话存到 Supabase + Pinecone（不阻塞响应）
-        # 持有 task 强引用避免被 GC，完成时自动从集合移除
+        # 💾 异步双写：把本轮对话存到 Supabase + Mem0（不阻塞响应）
         # ==========================================
         if sb and user_msg and (collected_content or tool_calls_dict):
-            task = asyncio.create_task(
-                self._save_conversation(sb, user_msg, collected_content, collected_reasoning, tool_calls_dict)
-            )
-            _pending_save_tasks.add(task)
-            task.add_done_callback(_pending_save_tasks.discard)
+            asyncio.create_task(self._save_conversation(sb, user_msg, collected_content, collected_reasoning, tool_calls_dict))
 
     async def _inject_context(self, req_data, sb, current_query):
         """
@@ -337,7 +345,7 @@ class HostFixMiddleware:
         - 系统当前状态（北京时间 / 沉默时长）
         - 用户画像（user_facts 表）
         - 阶段总结（memories 表 tags=Core_Cognition）
-        - Pinecone 向量语义记忆（可选）
+        - Mem0 向量记忆（可选）
         - 最近 N 条对话历史（按 tag 拉，转成 user/assistant 交替）
         """
         ai_name = os.environ.get("AI_NAME", "助手")
@@ -349,7 +357,6 @@ class HostFixMiddleware:
         time_str = now_bj.strftime("%Y-%m-%d %H:%M")
 
         # 沉默时长（从最近一条对话到现在的小时差，优雅降级）
-        # 注意：memories.created_at 由 _save_memory_to_db 写入，是北京时间字符串 "YYYY-MM-DD HH:MM:SS"
         silence_hours = 0
         try:
             res = await asyncio.to_thread(lambda: sb.table("memories").select("created_at").eq("tags", chat_tag).order("created_at", desc=True).limit(1).execute())
@@ -357,12 +364,8 @@ class HostFixMiddleware:
                 last = res.data[0].get("created_at", "")
                 if last:
                     try:
-                        # 兼容两种格式：DB 内置 "YYYY-MM-DD HH:MM:SS" 和可能的 ISO "YYYY-MM-DDTHH:MM:SS"
-                        raw = last[:19]
-                        fmt = "%Y-%m-%d %H:%M:%S" if "T" not in raw else "%Y-%m-%dT%H:%M:%S"
-                        last_dt = datetime.datetime.strptime(raw, fmt)
-                        # last_dt 已是北京时间，now_bj 也是北京时间，直接相减
-                        silence_hours = max(0, round((now_bj - last_dt).total_seconds() / 3600, 1))
+                        last_dt = datetime.datetime.strptime(last[:19], "%Y-%m-%dT%H:%M:%S")
+                        silence_hours = max(0, round((now_bj - (last_dt + datetime.timedelta(hours=8))).total_seconds() / 3600, 1))
                     except Exception:
                         pass
         except Exception:
@@ -386,22 +389,20 @@ class HostFixMiddleware:
         except Exception:
             pass
 
-        # 向量语义记忆（Pinecone，可选）
-        vector_context = "无相关深层记忆"
-        try:
-            import server
-            vc = getattr(server, "vector_client", None)
-            if vc and vc.index and current_query.strip():
+        # Mem0 向量记忆（可选）
+        mem0_context = "无相关深层记忆"
+        mc = _get_mem0()
+        if mc and current_query.strip():
+            try:
                 def _s():
-                    return vc.search(query=str(current_query), user_id=user_id, limit=5)
-                results = await asyncio.to_thread(_s)
-                if isinstance(results, list) and results:
-                    vector_context = "\n".join([
-                        f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}"
-                        for m in results
-                    ])
-        except Exception as e:
-            _log(f"Pinecone 检索失败（跳过）: {e}")
+                    return mc.search(query=str(current_query), user_id=user_id, filters={"user_id": user_id}, limit=5)
+                mr = await asyncio.to_thread(_s)
+                if mr:
+                    rl = mr.get("results", mr) if isinstance(mr, dict) else mr
+                    if isinstance(rl, list) and rl:
+                        mem0_context = "\n".join([f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in rl])
+            except Exception as e:
+                _log(f"Mem0 检索失败（跳过）: {e}")
 
         # 最近对话历史（按 tag 拉，转成 user/assistant 交替）
         history_msgs = []
@@ -436,7 +437,7 @@ class HostFixMiddleware:
             f"\n\n[系统当前状态]\n当前时间:{time_str}(北京时间),距离上次聊天:{silence_hours}h。\n"
             f"【{user_name}的核心画像】:\n{user_prof}\n\n"
             f"--- 以下为调取的历史背景记忆（请注意这是过去的事，不是现在正在聊的内容） ---\n"
-            f"【深层关联记忆】:\n{vector_context}\n"
+            f"【深层关联记忆】:\n{mem0_context}\n"
             f"【近3次阶段总结】:\n{core_summaries}\n"
             f"------------------------------------------------\n"
         )
@@ -467,10 +468,10 @@ class HostFixMiddleware:
             for j, hm in enumerate(history_msgs):
                 req_data["messages"].insert(sys_idx + j, hm)
 
-        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{len(core_summaries)}字 + 向量记忆{len(vector_context)}字 + 上文{len(history_msgs)}条")
+        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{len(core_summaries)}字 + Mem0{len(mem0_context)}字 + 上文{len(history_msgs)}条")
 
     async def _save_conversation(self, sb, user_msg, ai_msg, reasoning, tool_calls):
-        """异步把本轮对话存到 Supabase memories 表 + Pinecone"""
+        """异步把本轮对话存到 Supabase memories 表 + Mem0"""
         ai_name = os.environ.get("AI_NAME", "助手")
         user_name = os.environ.get("USER_NAME", "用户")
         user_id = os.environ.get("USER_ID", "default")
@@ -484,54 +485,46 @@ class HostFixMiddleware:
             tc_names = [tc.get("function", {}).get("name", "unknown") for tc in tool_calls.values()]
             final_save_text = f"[系统记录：调用了工具 {', '.join(tc_names)}]"
 
-        # 1. 存到 memories 表（user + assistant 两条）。失败自动重试一次。
-        def _save_both():
-            sb.table("memories").insert({
-                "title": f"💬 {user_name}说",
-                "content": f"{user_name}：{user_msg[:2000]}",
-                "category": "流水",
-                "mood": "平静",
-                "tags": chat_tag,
-                "created_at": now_str,
-            }).execute()
-            sb.table("memories").insert({
-                "title": f"🤖 {ai_name}回复",
-                "content": f"我({ai_name})：{final_save_text[:2000]}",
-                "category": "流水",
-                "mood": "温和",
-                "tags": chat_tag,
-                "created_at": now_str,
-            }).execute()
-
-        saved = False
-        for attempt in (1, 2):
-            try:
-                await asyncio.to_thread(_save_both)
-                saved = True
-                break
-            except Exception as e:
-                if attempt == 1:
-                    _log(f"⚠️ 存库首次失败，1s 后重试: {e}")
-                    await asyncio.sleep(1.0)
-                else:
-                    _log(f"❌ 存库重试仍失败，放弃: {e}")
-        if saved:
-            _log(f"💾 已存库：{user_name}问({len(user_msg)}字) + {ai_name}答({len(final_save_text)}字)")
-
-        # 2. 写入 Pinecone 向量记忆（可选）
+        # 1. 存到 memories 表（user + assistant 两条）
         try:
-            import server
-            vc = getattr(server, "vector_client", None)
-            if vc and vc.index and user_msg:
-                def _add_vec():
-                    vc.add([
+            def _save_user():
+                sb.table("memories").insert({
+                    "title": f"💬 {user_name}说",
+                    "content": f"{user_name}：{user_msg[:2000]}",
+                    "category": "流水",
+                    "mood": "平静",
+                    "tags": chat_tag,
+                    "created_at": now_str,
+                }).execute()
+            await asyncio.to_thread(_save_user)
+
+            def _save_ai():
+                sb.table("memories").insert({
+                    "title": f"🤖 {ai_name}回复",
+                    "content": f"我({ai_name})：{final_save_text[:2000]}",
+                    "category": "流水",
+                    "mood": "温和",
+                    "tags": chat_tag,
+                    "created_at": now_str,
+                }).execute()
+            await asyncio.to_thread(_save_ai)
+            _log(f"💾 已存库：{user_name}问({len(user_msg)}字) + {ai_name}答({len(final_save_text)}字)")
+        except Exception as e:
+            _log(f"❌ 存库失败: {e}")
+
+        # 2. 写入 Mem0（可选）
+        mc = _get_mem0()
+        if mc and user_msg:
+            try:
+                def _add_m():
+                    mc.add([
                         {"role": "user", "content": user_msg},
                         {"role": "assistant", "content": final_save_text},
                     ], user_id=user_id)
-                await asyncio.to_thread(_add_vec)
-                _log("🧠 Pinecone 已写入")
-        except Exception as e:
-            _log(f"Pinecone 写入失败: {e}")
+                await asyncio.to_thread(_add_m)
+                _log("🧠 Mem0 已写入")
+            except Exception as e:
+                _log(f"Mem0 写入失败: {e}")
 
         # 3. 🧠 异步触发全渠道统一对话总结（不阻塞响应）
         #    监控网页/QQ/TG/邮件等所有渠道的对话流水，

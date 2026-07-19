@@ -60,11 +60,16 @@ try:
 except Exception as e:
     print(f"⚠️ Supabase 初始化失败: {e}")
 
-# ---------- 向量记忆客户端 (Pinecone 单写) ----------
-# 长期语义记忆统一走 Pinecone：写入时用 SiliconFlow embedding 向量化后 upsert，
-# 检索时同样向量化后做 top_k 近邻查询。
-PINECONE_USER_ID = os.environ.get("PINECONE_USER_ID", "default").strip()  # 写入 Pinecone metadata 的用户隔离 ID
+# ---------- 长期记忆客户端 (Mem0 + Pinecone 双写) ----------
+# 还原原版 HybridMemoryClient：Mem0 为主，Pinecone 兜底双写，保证记忆不丢
+MEM0_API_KEY = os.environ.get("MEM0_API_KEY", "").strip()
+MEM0_USER_ID = os.environ.get("MEM0_USER_ID", "default").strip()
 PINECONE_KEY = os.environ.get("PINECONE_API_KEY", "").strip()
+
+try:
+    from mem0 import MemoryClient
+except ImportError:
+    MemoryClient = None
 
 try:
     from pinecone import Pinecone
@@ -72,56 +77,76 @@ except ImportError:
     Pinecone = None
 
 
-class VectorMemoryClient:
-    """Pinecone 向量记忆客户端。配齐 PINECONE_API_KEY + SiliconFlow embedding 即可用。"""
+class HybridMemoryClient:
+    """记忆双写客户端：Mem0 主路 + Pinecone 兜底，任一故障不影响记忆持久化。"""
 
     def __init__(self):
+        self.mem0 = MemoryClient(api_key=MEM0_API_KEY) if MEM0_API_KEY and MemoryClient else None
         self.pc = Pinecone(api_key=PINECONE_KEY) if PINECONE_KEY and Pinecone else None
         self.index_name = os.environ.get("PINECONE_INDEX_NAME", "notion-brain-v2")
         self.index = self.pc.Index(self.index_name) if self.pc else None
 
     def search(self, query, user_id=None, filters=None, limit=3):
-        """
-        语义搜索记忆，统一返回 list（无果返回空 list）。
-        每个元素是 dict，至少包含 'memory' 字段，便于调用方统一处理。
-        filters 参数保留兼容但当前未使用（Pinecone 按 metadata 过滤可后续扩展）。
-        """
-        if not self.index:
-            return []
-        try:
-            vec = _get_embedding(query)
-            if not vec:
-                return []
-            r = self.index.query(vector=vec, top_k=limit, include_metadata=True)
-            matches = [{"memory": m.metadata.get("text", ""), "id": m.id}
-                       for m in r.matches if m.metadata]
-            return matches
-        except Exception as e:
-            print(f"❌ Pinecone 搜索失败: {e}")
-            return []
+        user_id = user_id or MEM0_USER_ID
+        # 1. 优先 Mem0，但必须确认它确实返回了结果
+        if self.mem0:
+            try:
+                safe_filters = filters if filters else {"user_id": user_id}
+                res = self.mem0.search(query=query, filters=safe_filters, limit=limit)
+                res_list = res.get("results", res) if isinstance(res, dict) else res
+                if isinstance(res_list, list) and len(res_list) > 0:
+                    return res
+            except Exception as e:
+                print(f"⚠️ Mem0 搜索异常: {e}")
+        # 2. Mem0 无果则强制查询 Pinecone
+        if self.index:
+            try:
+                vec = _get_embedding(query)
+                if vec:
+                    r = self.index.query(vector=vec, top_k=limit, include_metadata=True)
+                    return {"results": [{"memory": m.metadata.get("text", ""), "id": m.id}
+                                        for m in r.matches if m.metadata]}
+            except Exception as e:
+                print(f"❌ Pinecone 搜索失败: {e}")
+        return []
 
     def add(self, messages, user_id=None):
-        """把消息向量化后 upsert 到 Pinecone。返回是否成功写入。"""
-        user_id = user_id or PINECONE_USER_ID
-        if not self.index:
-            return False
-        try:
-            if isinstance(messages, list):
-                text = " | ".join([f"{m.get('role')}: {m.get('content')}"
-                                   for m in messages if isinstance(m, dict)])
-            else:
-                text = str(messages)
-            vec = _get_embedding(text)
-            if not vec:
-                return False
-            self.index.upsert(vectors=[{"id": str(uuid.uuid4()), "values": vec,
-                                        "metadata": {"text": text, "user_id": user_id}}])
-            return True
-        except Exception as e:
-            print(f"❌ Pinecone 写入失败: {e}")
-            return False
+        user_id = user_id or MEM0_USER_ID
+        success = False
+        if self.mem0:
+            try:
+                self.mem0.add(messages, user_id=user_id)
+                success = True
+            except Exception as e:
+                print(f"⚠️ Mem0 写入异常: {e}")
+        # 同步双写 Pinecone（移除 early return，保证兜底）
+        if self.index:
+            try:
+                text = " | ".join([f"{m.get('role')}: {m.get('content')}" for m in messages if isinstance(m, dict)]) if isinstance(messages, list) else str(messages)
+                vec = _get_embedding(text)
+                if vec:
+                    self.index.upsert(vectors=[{"id": str(uuid.uuid4()), "values": vec,
+                                                "metadata": {"text": text, "user_id": user_id}}])
+                    success = True
+            except Exception as e:
+                print(f"❌ Pinecone 写入失败: {e}")
+        return success
+
+    def get_all(self, user_id=None):
+        user_id = user_id or MEM0_USER_ID
+        if self.mem0:
+            try:
+                return self.mem0.get_all(user_id=user_id)
+            except Exception:
+                pass
+        return []
 
     def delete(self, memory_id):
+        if self.mem0:
+            try:
+                self.mem0.delete(memory_id)
+            except Exception:
+                pass
         if self.index:
             try:
                 self.index.delete(ids=[memory_id])
@@ -130,7 +155,7 @@ class VectorMemoryClient:
         return True
 
 
-vector_client = VectorMemoryClient()
+mem0_client = HybridMemoryClient()
 
 # ---------- HTTP 会话 (连接池加速) ----------
 http_session = requests.Session()
@@ -159,17 +184,6 @@ WEIGHT_MAP = {
     MemoryType.EMOTION: 9, MemoryType.FACT: 10,
 }
 
-# 塔罗大阿卡纳牌组 (供 tarot_reading 工具抽样，提为模块级常量避免每次调用重建)
-TAROT_DECK = [
-    "0. 愚者 (The Fool)", "I. 魔术师 (The Magician)", "II. 女祭司 (The High Priestess)",
-    "III. 皇后 (The Empress)", "IV. 皇帝 (The Emperor)", "V. 教皇 (The Hierophant)",
-    "VI. 恋人 (The Lovers)", "VII. 战车 (The Chariot)", "VIII. 力量 (Strength)",
-    "IX. 隐士 (The Hermit)", "X. 命运之轮 (Wheel of Fortune)", "XI. 正义 (Justice)",
-    "XII. 倒吊人 (The Hanged Man)", "XIII. 死神 (Death)", "XIV. 节制 (Temperance)",
-    "XV. 魔鬼 (The Devil)", "XVI. 高塔 (The Tower)", "XVII. 星星 (The Star)",
-    "XVIII. 月亮 (The Moon)", "XIX. 太阳 (The Sun)", "XX. 审判 (Judgement)", "XXI. 世界 (The World)"
-]
-
 
 # ==========================================
 # 2. 核心辅助函数
@@ -186,25 +200,54 @@ def mcp_error_handler(func):
     return wrapper
 
 
-def _get_llm_client(provider: str = "main_chat"):
+def _get_llm_client(provider: str = "openai"):
     """
-    返回主对话模型的 LLM 客户端。provider 参数保留兼容历史调用方（值被忽略，
-    统一返回 main_chat）。可被数据库 user_facts 表 key='llm_settings' 的 JSON 动态覆盖。
-    视觉/STT/TTS 等专用模型不在本函数管辖，各自在调用处用独立 OpenAI 客户端。
+    多模型客户端工厂：按角色返回对应的 LLM 客户端。
+    完整还原原版 5 种 provider，所有密钥/地址/模型名均从环境变量读取。
+    - openai    : 通用默认模型 (OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL_NAME)
+    - main_chat : 主对话模型，可从数据库 llm_settings 动态覆盖 (CHAT_API_KEY / CHAT_BASE_URL / CHAT_MODEL_NAME)
+    - silicon1  : 硅基流动便宜模型 (SILICON1_API_KEY / SILICON1_BASE_URL / SILICON1_MODEL_NAME)
+    - vision    : 视觉/OCR 模型 (VISION_API_KEY / VISION_BASE_URL / VISION_MODEL_NAME)
+    - voice     : 语音/STT 模型，回退到 OPENAI (VOICE_API_KEY / VOICE_BASE_URL)
     """
     from openai import OpenAI
-    # 优先从数据库读取动态配置，回退到环境变量
-    db_conf = {}
-    if supabase:
-        try:
-            res = supabase.table("user_facts").select("value").eq("key", "llm_settings").execute()
-            db_conf = json.loads(res.data[0]['value']) if res.data else {}
-        except Exception:
-            db_conf = {}
-    api_key = db_conf.get("key") or os.environ.get("CHAT_API_KEY", "").strip()
-    base_url = db_conf.get("url") or os.environ.get("CHAT_BASE_URL", "https://api.minimaxi.com/v1")
-    model_name = db_conf.get("model") or os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
-    client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+    client = None
+    model_name = "gpt-3.5-turbo"
+
+    if provider == "silicon1":
+        api_key = os.environ.get("SILICON1_API_KEY", "").strip()
+        base_url = os.environ.get("SILICON1_BASE_URL", "https://api.siliconflow.cn/v1")
+        client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+        model_name = os.environ.get("SILICON1_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+    elif provider == "main_chat":
+        # 优先从数据库读取动态配置，回退到环境变量
+        db_conf = {}
+        if supabase:
+            try:
+                res = supabase.table("user_facts").select("value").eq("key", "llm_settings").execute()
+                db_conf = json.loads(res.data[0]['value']) if res.data else {}
+            except Exception:
+                db_conf = {}
+        api_key = db_conf.get("key") or os.environ.get("CHAT_API_KEY", "").strip()
+        base_url = db_conf.get("url") or os.environ.get("CHAT_BASE_URL", "https://api.minimaxi.com/v1")
+        model_name = db_conf.get("model") or os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
+        client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+    elif provider == "vision":
+        api_key = os.environ.get("VISION_API_KEY", "").strip()
+        base_url = os.environ.get("VISION_BASE_URL", "").strip()
+        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None) if api_key else None
+        model_name = os.environ.get("VISION_MODEL_NAME", "gpt-4o-mini")
+    elif provider == "voice":
+        api_key = os.environ.get("VOICE_API_KEY", os.environ.get("OPENAI_API_KEY", "")).strip()
+        base_url = os.environ.get("VOICE_BASE_URL", "https://api.openai.com/v1")
+        client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+    else:
+        # 默认 openai provider
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("DEFAULT_API_KEY", "").strip()
+        base_url = os.environ.get("OPENAI_BASE_URL", os.environ.get("DEFAULT_BASE_URL", "")).strip()
+        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None) if api_key else None
+        model_name = os.environ.get("OPENAI_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "gpt-3.5-turbo"))
+
     if client:
         client.custom_model_name = model_name
     return client
@@ -214,7 +257,7 @@ async def _ask_llm_async(client, prompt: str, system_prompt: str = "", temperatu
     """异步调用 LLM，自动剥离 <think> 标签，返回干净的纯文本。"""
     if not client:
         return ""
-    model_name = getattr(client, 'custom_model_name', os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat"))
+    model_name = getattr(client, 'custom_model_name', os.environ.get("OPENAI_MODEL_NAME", "gpt-3.5-turbo"))
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -277,13 +320,9 @@ def _save_memory_to_db(title: str, content: str, category: str = "流水", mood:
 
 
 def _get_embedding(text: str):
-    """调用向量嵌入 API 生成文本向量 (供 Pinecone 记忆检索用)。
-
-    实际请求的是硅基流动 (SiliconFlow) 的 embeddings 接口，
-    故变量名为 SILICONFLOW_API_KEY。
-    """
+    """调用向量嵌入 API 生成文本向量 (供 Pinecone 记忆检索用)。变量名兼容 DOUBAO_API_KEY。"""
     try:
-        api_key = os.environ.get("SILICONFLOW_API_KEY", "").strip()
+        api_key = os.environ.get("DOUBAO_API_KEY", "").strip()
         embed_endpoint = os.environ.get("DOUBAO_EMBEDDING_EP", "").strip()
         if not api_key or not embed_endpoint:
             return []
@@ -323,24 +362,6 @@ def _push_wechat(text: str, title: str = "通知"):
         }, timeout=15)
     except Exception as e:
         print(f"⚠️ 推送失败: {e}")
-
-
-def send_telegram_message(chat_id: str, text: str):
-    """
-    向指定 chat_id 发送一条 Telegram 消息。
-    供 napcat 掉线通知等需要"指定接收方"的场景调用（区别于 _push_wechat 写死的 TG_CHAT_ID）。
-    返回是否发送成功。
-    """
-    token = os.environ.get("TG_BOT_TOKEN", "").strip()
-    if not token or not chat_id:
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        resp = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
-        return resp.status_code == 200
-    except Exception as e:
-        print(f"⚠️ Telegram 发送失败 (chat_id={chat_id}): {e}")
-        return False
 
 
 def _send_email_helper(subject: str, content: str, is_html: bool = False):
@@ -535,10 +556,10 @@ async def echo(text: str):
 @mcp.tool()
 @mcp_error_handler
 async def save_memory(title: str, content: str, category: str = "事件"):
-    """【保存记忆】将一条信息持久化到数据库，同时写入 Pinecone 向量库。"""
+    """【保存记忆】将一条信息持久化到数据库，同时双写到 Mem0/Pinecone 向量库。"""
     await asyncio.to_thread(_save_memory_to_db, title, content, category)
     try:
-        await asyncio.to_thread(vector_client.add, [{"role": "assistant", "content": f"{title}: {content}"}])
+        await asyncio.to_thread(mem0_client.add, [{"role": "assistant", "content": f"{title}: {content}"}])
     except Exception:
         pass
     return f"✅ 记忆已保存: {title}"
@@ -549,14 +570,16 @@ async def save_memory(title: str, content: str, category: str = "事件"):
 async def search_memory(query: str):
     """【搜索记忆】先查向量库 (语义相似)，再查数据库 (关键词模糊)，合并结果。"""
     ans_parts = []
-    # 1. 向量语义搜索（search 统一返回 list）
+    # 1. 向量语义搜索
     try:
-        vec_results = await asyncio.to_thread(vector_client.search, query)
+        vec_results = await asyncio.to_thread(mem0_client.search, query)
         if vec_results:
-            ans_parts.append("🧠 【语义相似记忆】:")
-            for r in vec_results[:3]:
-                mem = r.get("memory", r.get("text", str(r))) if isinstance(r, dict) else str(r)
-                ans_parts.append(f"- {mem}")
+            res_list = vec_results.get("results", vec_results) if isinstance(vec_results, dict) else vec_results
+            if isinstance(res_list, list) and res_list:
+                ans_parts.append("🧠 【语义相似记忆】:")
+                for r in res_list[:3]:
+                    mem = r.get("memory", r.get("text", str(r))) if isinstance(r, dict) else str(r)
+                    ans_parts.append(f"- {mem}")
     except Exception:
         pass
     # 2. 数据库关键词搜索
@@ -1058,7 +1081,16 @@ async def manage_piggy_bank(action: str, amount: float = 0.0, reason: str = ""):
 @mcp_error_handler
 async def tarot_reading(question: str):
     """【塔罗占卜】抽取三张牌 (过去/现在/未来)，由 AI 解读。"""
-    draw = random.sample(TAROT_DECK, 3)
+    deck = [
+        "0. 愚者 (The Fool)", "I. 魔术师 (The Magician)", "II. 女祭司 (The High Priestess)",
+        "III. 皇后 (The Empress)", "IV. 皇帝 (The Emperor)", "V. 教皇 (The Hierophant)",
+        "VI. 恋人 (The Lovers)", "VII. 战车 (The Chariot)", "VIII. 力量 (Strength)",
+        "IX. 隐士 (The Hermit)", "X. 命运之轮 (Wheel of Fortune)", "XI. 正义 (Justice)",
+        "XII. 倒吊人 (The Hanged Man)", "XIII. 死神 (Death)", "XIV. 节制 (Temperance)",
+        "XV. 魔鬼 (The Devil)", "XVI. 高塔 (The Tower)", "XVII. 星星 (The Star)",
+        "XVIII. 月亮 (The Moon)", "XIX. 太阳 (The Sun)", "XX. 审判 (Judgement)", "XXI. 世界 (The World)"
+    ]
+    draw = random.sample(deck, 3)
     client = _get_llm_client("main_chat")
     if not client:
         return f"🔮 抽牌结果：{', '.join(draw)}。\n(⚠️ LLM 未配置，无法解读)"
@@ -1297,13 +1329,15 @@ def _print_config_report():
         return bool(os.environ.get(key, "").strip())
 
     items = [
+        ("LLM (默认模型)",    _ok("OPENAI_API_KEY") or _ok("DEFAULT_API_KEY"), os.environ.get("OPENAI_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "未设置"))),
         ("主对话 (CHAT)",     _ok("CHAT_API_KEY"),     os.environ.get("CHAT_MODEL_NAME", "未设置")),
-        ("识图 (VISION)",     _ok("VISION_API_KEY"),   os.environ.get("VISION_MODEL_NAME", "未设置")),
-        ("语音识别 (STT)",    _ok("SILICONFLOW_API_KEY"), "已配置" if _ok("SILICONFLOW_API_KEY") else "未配置"),
-        ("语音合成 (TTS)",    _ok("TTS_API_KEY"),      "已配置" if _ok("TTS_API_KEY") else "未配置"),
+        ("硅基 (SILICON1)",   _ok("SILICON1_API_KEY"), os.environ.get("SILICON1_MODEL_NAME", "未设置")),
+        ("视觉 (VISION)",     _ok("VISION_API_KEY"),   os.environ.get("VISION_MODEL_NAME", "未设置")),
+        ("语音 (VOICE)",      _ok("VOICE_API_KEY") or _ok("OPENAI_API_KEY"), "已配置" if _ok("VOICE_API_KEY") or _ok("OPENAI_API_KEY") else "未配置"),
         ("数据库 (Supabase)", _ok("SUPABASE_URL") and _ok("SUPABASE_KEY"), "已连接" if supabase else "未连接"),
-        ("向量记忆 (Pinecone)", _ok("PINECONE_API_KEY"), "已启用" if vector_client.index else "未配置"),
-        ("向量嵌入 (SiliconFlow)", _ok("SILICONFLOW_API_KEY"), "已配置" if _ok("SILICONFLOW_API_KEY") else "未配置"),
+        ("长期记忆 (Mem0)",   _ok("MEM0_API_KEY"),     "已启用" if mem0_client.mem0 else "未配置"),
+        ("向量库 (Pinecone)", _ok("PINECONE_API_KEY"), "已启用" if mem0_client.index else "未配置"),
+        ("向量嵌入 (Doubao)", _ok("DOUBAO_API_KEY"),   "已配置" if _ok("DOUBAO_API_KEY") else "未配置"),
         ("Telegram 推送",     _ok("TG_BOT_TOKEN") and _ok("TG_CHAT_ID"), "已配置" if _ok("TG_BOT_TOKEN") else "未配置 Token"),
         ("Gmail/日历",        _ok("GOOGLE_USER_TOKEN_JSON"), "已配置 OAuth" if _ok("GOOGLE_USER_TOKEN_JSON") else "未配置 OAuth"),
         ("邮件发送 (Resend)", _ok("RESEND_API_KEY") and _ok("MY_EMAIL"), "已配置" if _ok("RESEND_API_KEY") else "未配置"),

@@ -20,12 +20,12 @@
 │  ┌────────────────────────┐  │   │  (后台 daemon 线程池)      │
 │  │ HostFixMiddleware      │──┼───┼─► 自主生命循环            │
 │  │  • /health 健康检查     │  │   │  • Telegram 轮询         │
-│  │  • /api/logs  日志      │  │   │  • 消息总结器            │
-│  │  • /v1/chat/completions │  │   │  • 提醒巡视器            │
-│  │  • /qq-ws (反向WS端点)  │  │   │  • 日程小秘书            │
-│  └────────────────────────┘  │   │  • 信箱巡视器(默认关)     │
-└──────────┬───────────────────┘   │  • 环境变量热同步          │
-                                  └──────────────────────────┘
+│  │  • /api/config 热更新   │  │   │  • 消息总结器            │
+│  │  • /api/logs  日志      │  │   │  • 提醒巡视器            │
+│  │  • /api/restart 重启    │  │   │  • 日程小秘书            │
+│  │  • /qq-ws (反向WS端点)  │  │   │  • 信箱巡视器            │
+│  └────────────────────────┘  │   │  • 环境变量热同步          │
+└──────────┬───────────────────┘   └──────────────────────────┘
            ▼
 ┌──────────────────────────────┐   ┌──────────────────────────┐
 │      server.py               │   │     napcat.py            │
@@ -38,7 +38,7 @@
 │  • send_notification         │   ┌──────────────────────────┐
 │  • send_email_via_api        │   │     外部依赖 (可选)        │
 │  • web_search                │   │  • Supabase (数据库)      │
-│  • check_inbox / read_email  │   │  • Pinecone (向量记忆)    │
+│  • check_inbox / read_email  │   │  • Mem0 (长期记忆)        │
 │  • add/get/modify_calendar   │   │  • Gmail / Calendar API   │
 └──────────────────────────────┘   └──────────────────────────┘
 ```
@@ -50,9 +50,8 @@
 | `server.py` | **MCP 工具层** | 注册所有 `@mcp.tool` 工具，是 LLM 调用的入口 |
 | `gateway.py` | **ASGI 中间件层** | Host 修正、CORS、管理接口、WS 端点路由 |
 | `heartbeat.py` | **后台心跳层** | 7 个 daemon 线程，驱动"自主生命感" |
-| `napcat.py` | **QQ 接入层** | NapCat OneBot 协议接入，反向 WS 接入 + 全渠道对话自动总结 |
-| `VARIABLES.md` | **配置清单** | 所有环境变量的完整文档（必填/可选/默认值） |
-| `DEPLOY_ZEABUR_新手版.md` | **部署教程** | Zeabur 零基础图文部署教程 |
+| `napcat.py` | **QQ 接入层** | NapCat OneBot 协议接入，反向/正向 WS 双模 |
+| `.env.example` | **配置模板** | 所有可配置项的文档化示例 |
 
 ---
 
@@ -66,19 +65,14 @@ pip install -r requirements.txt
 
 ### 2. 配置环境变量
 
-参照 [`VARIABLES.md`](VARIABLES.md) 创建 `.env` 文件（或直接在部署平台注入环境变量）：
-
 ```bash
-# Windows: 手动新建 .env 文本文件
-# Linux/Mac:
-cp /dev/null .env   # 然后用编辑器填入内容
+cp .env.example .env
+# 编辑 .env，填入你的真实配置
 ```
 
-**最小化配置**（只跑通 MCP 工具 + LLM 对话）只需设置：
-- `CHAT_API_KEY` — 主对话模型的 API Key
-- `CHAT_MODEL_NAME` — 模型名（默认 `abab6.5s-chat`，可换成任意 OpenAI 兼容服务）
-
-> 注：本项目已统一只用 `CHAT_*` 一组 LLM 凭据（覆盖 MCP 工具/心跳/日记/`/v1/*` 代理全部场景），不再使用 `OPENAI_*` 或 `DEFAULT_*` 变量。
+**最小化配置**（只跑通 MCP 工具）只需设置：
+- `OPENAI_API_KEY` — LLM 的 API Key
+- `OPENAI_MODEL_NAME` — 模型名
 
 ### 3. 启动
 
@@ -100,12 +94,13 @@ http://<你的域名或IP>:10000/sse
 
 ## 🧩 MCP 工具清单
 
-> 网关共注册 **27 个 MCP 工具**（按子系统分组，按需配置即可启用）。下表仅列对外暴露的 `@mcp.tool()` 工具。
+> 网关共注册 **30+ 个 MCP 工具**，按子系统分组（按需配置即可启用）：
 
 | 分类 | 工具 | 功能 |
 |------|------|------|
 | 基础 | `echo` | 回声测试 |
-| 记忆 | `save_memory` / `search_memory` | 记忆存取（数据库 + Pinecone 向量语义检索）|
+| 记忆 | `save_memory` / `search_memory` | 记忆存取（数据库 + Mem0/Pinecone 向量双写双搜）|
+| 记忆 | `get_latest_diary` | 加载最新记忆流（长期总结 + 短期对话 + 小屋动态）|
 | 画像 | `manage_user_fact` / `get_user_profile` | 用户画像 CRUD |
 | 知识库 | `organize_knowledge_base` | 通用知识库 CRUD |
 | 提醒 | `manage_reminder` | 闹钟/提醒 (数据库持久版) |
@@ -114,35 +109,26 @@ http://<你的域名或IP>:10000/sse
 | 邮件 | `check_inbox` / `read_full_email` / `reply_external_email` | Gmail 收发 |
 | 日历 | `add_calendar_event` / `get_calendar_events` / `modify_calendar_event` | Google 日历 |
 | 搜索 | `web_search` | 网页搜索 (Tavily 优先 + DDG 兜底) |
+| 模型 | `switch_ai_brain` | 热切换 LLM 角色 (openai/main_chat/silicon1/vision/voice) |
 | 生活 | `manage_memory_house` | AI 虚拟生活小屋 (陪伴感) |
 | 生活 | `save_expense` / `check_expense_report` / `manage_piggy_bank` | 记账 + 账单 + 储蓄罐 |
+| 生活 | `where_is_user` / `explore_surroundings` | GPS 定位 + 周边探索 (高德) |
 | 娱乐 | `tarot_reading` | AI 塔罗占卜 |
 | 多媒体 | `render_html_to_image` | HTML/CSS 转图片 (HCTI) |
 | 多媒体 | `compose_music` / `cover_existing_song` | AI 作曲 + AI 翻唱 (Replicate) |
 | 笔记 | `list_obsidian_cloud` / `read_obsidian_cloud` / `write_obsidian_cloud` | WebDAV 云端笔记 (Obsidian) |
 
-> 💡 此外还有这些**非 MCP 工具的内置能力**（由心跳/接入层自动触发，无需 LLM 主动调用）：
-> - `server.py`：`get_latest_diary()`（加载记忆流）、`where_is_user()`（读 GPS + 天气）
-> - `heartbeat.py` TG 轮询：收到图片自动调 `VISION_*` 识图；收到语音自动 STT 转文字，回复用 `TTS_*` 合成语音条发回
-> - `napcat.py` QQ 接入：收到带图消息自动 OCR（需开 `OCR_ENABLED=true` + `VISION_API_KEY`）
->
-> LLM 角色切换通过环境变量前缀配置（`CHAT_*` / `VISION_*` / `STT_*` / `TTS_*`），无对外热切换工具。
-
 ---
 
-## 📡 管理 API & 路由
+## 📡 管理 API
 
 | 路径 | 方法 | 功能 |
 |------|------|------|
-| `/` | GET | 占位首页（列出主要端点） |
 | `/health` | GET | 健康检查 |
-| `/api/logs` | GET | 读取 gateway.py 最近运行日志（需 `API_SECRET` 鉴权） |
-| `/v1/models` | GET | OpenAI 兼容：列出可用模型 |
-| `/v1/chat/completions` | POST | OpenAI 兼容代理（配 Supabase 后自动启用智能体模式：注入画像/记忆/上文 + 流式双写） |
-| `/sse`、`/messages` | — | MCP 协议端点（透传给 FastMCP 下游，需 `API_SECRET` 鉴权） |
+| `/api/config` | POST | 热更新环境变量 (JSON body) |
+| `/api/logs` | GET | 读取最近日志 |
+| `/api/restart` | POST | 触发云平台重启 (需配 `RESTART_WEBHOOK_URL`) |
 | `/qq-ws` | WS | NapCat 反向 WebSocket 端点 |
-
-> 🔐 当配置了 `API_SECRET` 时，`/api/*`、`/sse`、`/messages`、`/v1/*` 均强制校验密钥（`Authorization: Bearer <key>` 或 `X-API-Key` 头）。
 
 ---
 
@@ -154,8 +140,6 @@ http://<你的域名或IP>:10000/sse
 |------|---------|---------|
 | 自主生命循环 | 配置了 LLM | 2 小时 |
 | Telegram 轮询 | 配置了 `TG_BOT_TOKEN` | 长轮询 |
-| └ TG 识图 | + `VISION_API_KEY` | 收到图片时 |
-| └ TG 语音 | + `SILICONFLOW_API_KEY` (STT) / `TTS_API_KEY` (TTS) | 收到语音时 |
 | 消息总结器 | 配置了 LLM + Supabase | 30 分钟 |
 | 提醒巡视器 | 配置了 Supabase | 每分钟 |
 | 日程小秘书 | 配置了 `GOOGLE_USER_TOKEN_JSON` | 07:30 / 22:00 |
@@ -217,7 +201,7 @@ create table expenses (
   date date
 );
 
--- 设备定位数据 (可选，供内部 where_is_user() 函数读取 GPS + 天气使用)
+-- 设备定位数据 (可选，供 where_is_user / explore_surroundings 使用)
 create table device_data (
   id bigint generated always as identity primary key,
   timestamp text,
@@ -243,8 +227,8 @@ create table device_data (
 
 ```bash
 # 1. 准备配置文件
-# 新建 .env 文本文件（参照 VARIABLES.md 填写），Windows 可直接用记事本新建
-# Linux/Mac: touch .env && nano .env
+cp .env.example .env
+# 编辑 .env 填入真实配置
 
 # 2. 构建并启动
 docker compose up -d
@@ -282,7 +266,7 @@ docker run -d --name mcp-gateway --restart unless-stopped \
    - Build Command: `pip install -r requirements.txt`
    - Start Command: `python server.py`
 4. **注入环境变量**：在平台后台把 `.env` 里的变量逐条填入
-   - 必填：`CHAT_API_KEY`（主对话模型 Key）、可选 `CHAT_MODEL_NAME`
+   - 必填：`OPENAI_API_KEY`、`OPENAI_MODEL_NAME`
    - 端口：平台会自动注入 `PORT`，无需手动设
 5. **暴露端口**：设为 `10000`（或代码读取的 `PORT`）
 6. **绑定域名**：平台自动分配 HTTPS 域名，直接用
@@ -401,8 +385,8 @@ source venv/bin/activate        # Linux/Mac
 pip install -r requirements.txt
 
 # 3. 配置环境变量
-# 新建 .env 文件，参照 VARIABLES.md 填写，至少配 CHAT_API_KEY
-# Windows 可直接用记事本新建；Linux/Mac: touch .env
+cp .env.example .env
+# 编辑 .env，至少填入 OPENAI_API_KEY 和 OPENAI_MODEL_NAME
 
 # 4. 运行
 python server.py
@@ -432,7 +416,7 @@ curl http://localhost:10000/health
 - ✅ **零硬编码密钥**：所有 API Key、Token、URL 均从环境变量读取
 - ✅ **无个人化数据**：移除了人设、私人域名、用户 ID 等
 - ✅ **统一错误兜底**：`mcp_error_handler` 装饰器防止单个工具崩溃影响整体
-- ✅ **可选依赖**：Supabase / Pinecone / Gmail 等缺失时优雅降级而非报错
+- ✅ **可选依赖**：Supabase / Mem0 / Pinecone / Gmail 等缺失时优雅降级而非报错
 - ✅ **管理接口鉴权**：所有 `/api/*` 接口强制校验 `API_SECRET` 密钥
 
 ---
@@ -441,7 +425,7 @@ curl http://localhost:10000/health
 
 - **新增 MCP 工具**：在 `server.py` 中仿照现有工具添加 `@mcp.tool()` 函数即可
 - **新增消息渠道**：在 `heartbeat.py` 中添加新的轮询协程，复用 `_get_llm_client` / `_push_wechat`
-- **替换 LLM**：配置 `CHAT_API_KEY` / `CHAT_BASE_URL` / `CHAT_MODEL_NAME`（或按角色配 `VISION_*` / `VOICE_*` / `SILICON1_*`，均兼容任意 OpenAI 兼容服务）
+- **替换 LLM**：只需修改 `OPENAI_BASE_URL` 和 `OPENAI_MODEL_NAME`（或配置多角色 `CHAT_*` / `VISION_*` / `VOICE_*`）
 - **替换数据库**：将 `server.py` 顶部的 `supabase = ...` 改为你的客户端即可
 
 ---

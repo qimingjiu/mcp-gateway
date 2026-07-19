@@ -41,20 +41,20 @@
 1. 打开 https://platform.openai.com/
 2. 注册登录（可能需要国外手机号）
 3. 点右上角头像 → `View API keys`
-4. 点 `Create new secret key` → 复制那串 `sk-...` → 这就是你的 `CHAT_API_KEY`
+4. 点 `Create new secret key` → 复制那串 `sk-...` → 这就是你的 `OPENAI_API_KEY`
 
 **选 B：用 DeepSeek（国产，便宜，中文友好，推荐新手）**
 1. 打开 https://platform.deepseek.com/
 2. 手机号注册登录
 3. 左边菜单点 `API keys` → `创建 API Key`
-4. 复制那串 `sk-...` → 这就是你的 `CHAT_API_KEY`
+4. 复制那串 `sk-...` → 这就是你的 `OPENAI_API_KEY`
 5. 记住模型名是 `deepseek-chat`
 
 **选 C：用硅基流动 SiliconFlow（国产聚合平台，模型多，有免费额度）**
 1. 打开 https://siliconflow.cn/
 2. 注册登录
 3. 左边点 `API 密钥` → `新建密钥`
-4. 复制那串 `sk-...` → 这就是你的 `CHAT_API_KEY`
+4. 复制那串 `sk-...` → 这就是你的 `OPENAI_API_KEY`
 5. 记住 Base URL 是 `https://api.siliconflow.cn/v1`
 
 > 💡 **不知道选哪个？新手就选 DeepSeek**，便宜好用，注册送钱。
@@ -168,34 +168,33 @@ Zeabur 不能直接读你电脑上的文件，得先把代码放到 GitHub（一
 **如果你用的是 DeepSeek**，把下面这段复制到 RAW 编辑器（注意把 `你的DeepSeek密钥` 换成你真正的 key）：
 
 ```
-CHAT_API_KEY=你的DeepSeek密钥
-CHAT_BASE_URL=https://api.deepseek.com/v1
-CHAT_MODEL_NAME=deepseek-chat
+OPENAI_API_KEY=你的DeepSeek密钥
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_MODEL_NAME=deepseek-chat
 API_SECRET=随便打一串字母数字当密码比如abc123xyz
 ```
 
 **如果你用的是 OpenAI**，填这个：
 
 ```
-CHAT_API_KEY=你的OpenAI密钥sk-xxxx
-CHAT_BASE_URL=https://api.openai.com/v1
-CHAT_MODEL_NAME=gpt-4o-mini
+OPENAI_API_KEY=你的OpenAI密钥sk-xxxx
+OPENAI_MODEL_NAME=gpt-4o-mini
 API_SECRET=随便打一串字母数字当密码比如abc123xyz
 ```
 
 **如果你用的是硅基流动 SiliconFlow**，填这个：
 
 ```
-CHAT_API_KEY=你的硅基流动密钥
-CHAT_BASE_URL=https://api.siliconflow.cn/v1
-CHAT_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+OPENAI_API_KEY=你的硅基流动密钥
+OPENAI_BASE_URL=https://api.siliconflow.cn/v1
+OPENAI_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
 API_SECRET=随便打一串字母数字当密码比如abc123xyz
 ```
 
 > 🧸 **宝宝解释**：
-> - `CHAT_API_KEY` = 你的 AI 钥匙（OpenAI / DeepSeek / 硅基流动 的 key 都填这里，程序只认格式不认公司）
-> - `CHAT_BASE_URL` = 告诉程序"去哪家公司问"，DeepSeek/硅基流动要填，OpenAI 也要填（`https://api.openai.com/v1`）
-> - `CHAT_MODEL_NAME` = 用哪个 AI 模型
+> - `OPENAI_API_KEY` = 你的 AI 钥匙（虽然是这个变量名，但填 DeepSeek 的 key 也行，程序只认格式）
+> - `OPENAI_BASE_URL` = 告诉程序"去哪家公司问"，DeepSeek/硅基流动要填，OpenAI 不用填（默认就是它）
+> - `OPENAI_MODEL_NAME` = 用哪个 AI 模型
 > - `API_SECRET` = 你自己设的管理密码，**记住它**，以后改设置要用
 
 ### 3.3 保存
@@ -344,7 +343,7 @@ https://你的域名.zeabur.app/sse
 
 | 报错 | 原因 | 解决 |
 |------|------|------|
-| `Server 未配置 CHAT_API_KEY` | 没配 API Key | 回第三步配好 `CHAT_API_KEY` |
+| `OPENAI_API_KEY not set` | 没配 API Key | 回第三步配好 |
 | `key must be sk- format` | Key 格式不对 | 检查是不是复制时多了空格 |
 | `Connection refused` / `port error` | 端口不对 | 确认 Networking 里 Port = 10000 |
 

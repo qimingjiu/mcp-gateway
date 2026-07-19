@@ -14,7 +14,6 @@ import os
 import re
 import json
 import time
-import uuid
 import asyncio
 import datetime
 
@@ -54,34 +53,6 @@ NAPCAT_ALLOWED_GROUPS_LIST = [x.strip() for x in NAPCAT_ALLOWED_GROUPS.split(","
 RECONNECT_INITIAL_DELAY = int(os.environ.get("NAPCAT_RECONNECT_DELAY", 5))
 RECONNECT_BACKOFF_FACTOR = float(os.environ.get("NAPCAT_BACKOFF_FACTOR", 1.5))
 RECONNECT_MAX_DELAY = int(os.environ.get("NAPCAT_MAX_DELAY", 60))
-
-# 📷 QQ 图片 OCR 识图配置 (收到带图消息时自动识别图片内容，拼到文本里给 LLM)
-# ⚠️ 必须用支持 Vision 的 API（如 gpt-4o-mini / Qwen-VL），聊天模型不支持图片输入
-OCR_ENABLED = os.environ.get("OCR_ENABLED", "false").strip().lower() in ("true", "1", "yes")
-OCR_MAX_IMAGES = int(os.environ.get("OCR_MAX_IMAGES", "3"))
-_ocr_client = None  # OCR 专用 Vision 客户端 (懒加载)
-
-
-def _get_ocr_client():
-    """获取 OCR 专用的 Vision 客户端（独立于聊天模型，未配 VISION_* 则返回 None）"""
-    global _ocr_client
-    if _ocr_client is not None:
-        return _ocr_client
-    try:
-        from openai import OpenAI
-    except ImportError:
-        _naplog("📷 ❌ 缺少 openai 库，OCR 不可用")
-        return None
-    vision_key = os.environ.get("VISION_API_KEY", "").strip()
-    if not vision_key:
-        _naplog("📷 OCR 未配置 VISION_API_KEY，识图功能跳过")
-        return None
-    vision_base = os.environ.get("VISION_BASE_URL", "https://api.openai.com/v1").strip()
-    vision_model = os.environ.get("VISION_MODEL_NAME", "gpt-4o-mini").strip()
-    _ocr_client = OpenAI(api_key=vision_key, base_url=vision_base)
-    _ocr_client.custom_model_name = vision_model
-    _naplog(f"📷 OCR 客户端就绪: model={vision_model}")
-    return _ocr_client
 
 
 # ==========================================
@@ -166,33 +137,31 @@ def _set_napcat_qr_code(qr_url):
 
 
 def update_napcat_config(config: dict):
-    """热更新 NapCat 配置 (同时写入模块级全局变量 + os.environ)。
+    """热更新 NapCat 配置 (同时写入模块级全局变量)。"""
+    global NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_BOT_QQ
+    global NAPCAT_TARGET_USER, NAPCAT_NOTIFY_QQ, NAPCAT_ALLOWED_GROUPS
+    global NAPCAT_NOTIFY_QQ_LIST, NAPCAT_ALLOWED_GROUPS_LIST
 
-    config 的 key → 对应的环境变量名 / 全局变量名映射见 _CONFIG_MAP。
-    """
-    # config_key → (模块全局变量名, 环境变量名)；逗号列表型字段额外维护 _LIST 派生变量
-    _CONFIG_MAP = {
-        "ws_url":        ("NAPCAT_WS_URL",         "NAPCAT_WS_URL"),
-        "http_url":      ("NAPCAT_HTTP_URL",       "NAPCAT_HTTP_URL"),
-        "bot_qq":        ("NAPCAT_BOT_QQ",         "NAPCAT_BOT_QQ"),
-        "target_user":   ("NAPCAT_TARGET_USER",    "NAPCAT_TARGET_USER"),
-        "notify_qq":     ("NAPCAT_NOTIFY_QQ",      "NAPCAT_NOTIFY_QQ"),
-        "allowed_groups":("NAPCAT_ALLOWED_GROUPS", "NAPCAT_ALLOWED_GROUPS"),
-    }
-
-    g = globals()
-    for cfg_key, (var_name, env_name) in _CONFIG_MAP.items():
-        val = config.get(cfg_key)
-        if not val:
-            continue
-        val = str(val).strip()
-        g[var_name] = val
-        os.environ[env_name] = val
-        # 逗号分隔字段：刷新对应的 _LIST 派生变量
-        if cfg_key == "notify_qq":
-            g["NAPCAT_NOTIFY_QQ_LIST"] = [x.strip() for x in val.split(",") if x.strip()]
-        elif cfg_key == "allowed_groups":
-            g["NAPCAT_ALLOWED_GROUPS_LIST"] = [x.strip() for x in val.split(",") if x.strip()]
+    if "ws_url" in config and config["ws_url"]:
+        NAPCAT_WS_URL = str(config["ws_url"]).strip()
+        os.environ["NAPCAT_WS_URL"] = NAPCAT_WS_URL
+    if "http_url" in config and config["http_url"]:
+        NAPCAT_HTTP_URL = str(config["http_url"]).strip()
+        os.environ["NAPCAT_HTTP_URL"] = NAPCAT_HTTP_URL
+    if "bot_qq" in config and config["bot_qq"]:
+        NAPCAT_BOT_QQ = str(config["bot_qq"]).strip()
+        os.environ["NAPCAT_BOT_QQ"] = NAPCAT_BOT_QQ
+    if "target_user" in config and config["target_user"]:
+        NAPCAT_TARGET_USER = str(config["target_user"]).strip()
+        os.environ["NAPCAT_TARGET_USER"] = NAPCAT_TARGET_USER
+    if "notify_qq" in config and config["notify_qq"]:
+        NAPCAT_NOTIFY_QQ = str(config["notify_qq"]).strip()
+        os.environ["NAPCAT_NOTIFY_QQ"] = NAPCAT_NOTIFY_QQ
+        NAPCAT_NOTIFY_QQ_LIST = [x.strip() for x in NAPCAT_NOTIFY_QQ.split(",") if x.strip()]
+    if "allowed_groups" in config and config["allowed_groups"]:
+        NAPCAT_ALLOWED_GROUPS = str(config["allowed_groups"]).strip()
+        os.environ["NAPCAT_ALLOWED_GROUPS"] = NAPCAT_ALLOWED_GROUPS
+        NAPCAT_ALLOWED_GROUPS_LIST = [x.strip() for x in NAPCAT_ALLOWED_GROUPS.split(",") if x.strip()]
 
 
 # ==========================================
@@ -206,8 +175,7 @@ async def _call_napcat_api(action: str, params: dict = None, timeout: float = 10
     """
     if not _napcat_ws_send:
         return None
-    # 用 uuid 保证 echo 全局唯一，避免高并发下 id(params) 地址复用导致响应错配
-    echo = f"req_{uuid.uuid4().hex[:12]}"
+    echo = f"req_{int(time.time() * 1000)}_{id(params)}"
     payload = {"action": action, "params": params or {}, "echo": echo}
 
     fut = asyncio.get_event_loop().create_future()
@@ -286,74 +254,6 @@ async def _send_disconnect_notification():
 # 5. 消息处理
 # ==========================================
 
-def _extract_image_urls(text):
-    """从 QQ CQ 码中提取所有图片 URL（支持 url=xxx 和 file=http... 格式）。"""
-    urls = []
-    for match in re.finditer(r'\[CQ:image([^\]]*)\]', text):
-        params = match.group(1)
-        url_match = re.search(r'url=([^\s,\]]+)', params)
-        if url_match:
-            urls.append(url_match.group(1))
-        else:
-            file_match = re.search(r'file=([^\s,\]]+)', params)
-            if file_match and file_match.group(1).startswith('http'):
-                urls.append(file_match.group(1))
-    return urls[:OCR_MAX_IMAGES]
-
-
-async def _ocr_image(image_url):
-    """用 Vision API 识别单张图片，返回识别到的文字/描述（失败返回空串）。"""
-    if not OCR_ENABLED or not image_url:
-        return ""
-    try:
-        client = await asyncio.to_thread(_get_ocr_client)
-        if not client:
-            return ""
-        model_name = getattr(client, 'custom_model_name', 'gpt-4o-mini')
-
-        def _call_vision():
-            return client.chat.completions.create(
-                model=model_name,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "请仔细识别这张图片中的所有文字内容并完整输出。如果是聊天记录/对话请完整还原。如果没有文字，简要描述图片内容。直接输出结果。"},
-                        {"type": "image_url", "image_url": {"url": image_url}}
-                    ]
-                }],
-                max_tokens=800,
-                timeout=30,
-            )
-        resp = await asyncio.wait_for(asyncio.to_thread(_call_vision), timeout=35)
-        if resp.choices:
-            result = resp.choices[0].message.content.strip()
-            if result:
-                _naplog(f"📷 OCR 成功: {result[:50]}...")
-                return result
-    except asyncio.TimeoutError:
-        _naplog(f"📷 OCR 超时: {image_url[:50]}")
-    except Exception as e:
-        _naplog(f"📷 OCR 失败: {e}")
-    return ""
-
-
-async def _ocr_process_message(raw_text):
-    """处理消息中所有图片，返回拼接好的 OCR 文本（无图或未启用返回空串）。"""
-    if not OCR_ENABLED:
-        return ""
-    image_urls = _extract_image_urls(raw_text)
-    if not image_urls:
-        return ""
-    _naplog(f"📷 检测到 {len(image_urls)} 张图片，开始 OCR...")
-    ocr_results = []
-    for i, url in enumerate(image_urls):
-        ocr_text = await _ocr_image(url)
-        if ocr_text:
-            prefix = f"[图片{i+1}内容]" if len(image_urls) > 1 else "[图片内容]"
-            ocr_results.append(f"{prefix}: {ocr_text}")
-    return "\n".join(ocr_results)
-
-
 async def _process_napcat_message(data: dict, send):
     """处理一条收到的 QQ 消息。"""
     try:
@@ -380,13 +280,6 @@ async def _process_napcat_message(data: dict, send):
             if NAPCAT_TARGET_USER and str(sender_id) != NAPCAT_TARGET_USER:
                 return
             clean_text = raw_message.strip()
-
-        # 📷 OCR：如果消息含图片 CQ 码，识别图片内容拼到文本后
-        ocr_text = await _ocr_process_message(raw_message)
-        if ocr_text:
-            # 剥离原始 CQ 图片码，避免 LLM 看到乱码
-            clean_text = re.sub(r'\[CQ:image[^\]]*\]', '', clean_text).strip()
-            clean_text = f"{clean_text}\n{ocr_text}".strip() if clean_text else ocr_text
 
         if not clean_text:
             return
@@ -643,8 +536,98 @@ async def handle_napcat_ws(scope, receive, send):
 
 
 # ==========================================
-# 7. 主动客户端模式 (未启用，已移除)
+# 7. 主动客户端模式 (可选)
 # ==========================================
-# 历史上曾有 napcat_client_loop() (主动连正向 WS) 和 _check_napcat_login_status()
-# 两个函数，但全项目无任何调用方，已删除以减少维护负担。
-# 如需主动连接模式，可参考 git 历史恢复，并在 start_autonomous_life() 中挂起。
+
+async def napcat_client_loop():
+    """
+    主动连接 NapCat 的正向 WS (客户端模式)。
+    当无法使用反向 WS 时，可启动此循环。
+    """
+    if not websockets:
+        _naplog("缺少 websockets 库，客户端模式无法启动")
+        return
+
+    global _napcat_connected, _napcat_last_connected_at, _napcat_status_message
+
+    if not NAPCAT_WS_URL:
+        _naplog("未配置 NAPCAT_WS_URL，客户端模式休眠")
+        return
+
+    _naplog(f"客户端模式启动，目标: {NAPCAT_WS_URL}")
+    delay = RECONNECT_INITIAL_DELAY
+
+    while True:
+        try:
+            _napcat_status_message = "正在连接..."
+            async with websockets.connect(NAPCAT_WS_URL, ping_interval=30, ping_timeout=10, close_timeout=5) as ws:
+                _naplog("已连接")
+                _napcat_connected = True
+                _napcat_last_connected_at = time.time()
+                _napcat_status_message = "已连接"
+                delay = RECONNECT_INITIAL_DELAY
+
+                async for raw_text in ws:
+                    try:
+                        data = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("post_type") == "meta_event":
+                        _napcat_last_connected_at = time.time()
+                        continue
+                    if data.get("post_type") == "notice":
+                        continue
+                    if data.get("post_type") != "message":
+                        continue
+                    try:
+                        await _process_napcat_message(data, ws.send)
+                    except Exception:
+                        pass
+
+        except (websockets.exceptions.ConnectionClosed, ConnectionRefusedError, OSError) as e:
+            _naplog(f"连接断开: {e}")
+            _napcat_connected = False
+            _napcat_status_message = f"连接断开: {str(e)[:50]}"
+            await _send_disconnect_notification()
+        except Exception as e:
+            _naplog(f"意外错误: {e}")
+            _napcat_connected = False
+            _napcat_status_message = f"错误: {str(e)[:50]}"
+            await _send_disconnect_notification()
+
+        _naplog(f"{delay}秒后重连...")
+        await asyncio.sleep(delay)
+        delay = min(delay * RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_DELAY)
+
+
+async def _check_napcat_login_status():
+    """通过 HTTP 接口检查登录状态并获取二维码 (如可用)。"""
+    if not _requests or not NAPCAT_HTTP_URL:
+        return None
+    try:
+        url = f"{NAPCAT_HTTP_URL}/get_login_info"
+        resp = _requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("status") == "ok":
+                login_info = data.get("data", {})
+                if login_info.get("user_id"):
+                    _set_napcat_qr_code(None)
+                    return {"status": "logged_in", "user_id": login_info["user_id"], "nickname": login_info.get("nickname", "")}
+    except Exception as e:
+        _naplog(f"⚠️ 检查登录状态失败: {e}")
+
+    try:
+        url = f"{NAPCAT_HTTP_URL}/get_qr_code"
+        resp = _requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("status") == "ok":
+                qr_url = data.get("data", {}).get("url") or data.get("data", {}).get("qr_code")
+                if qr_url:
+                    _set_napcat_qr_code(qr_url)
+                    return {"status": "need_login", "qr_code": qr_url}
+    except Exception as e:
+        _naplog(f"⚠️ 获取二维码失败: {e}")
+
+    return None
