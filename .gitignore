@@ -1,0 +1,22 @@
+# 密钥文件——绝不能上传！
+.env
+.env.local
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+venv/
+.venv/
+
+# 编辑器/系统垃圾
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
