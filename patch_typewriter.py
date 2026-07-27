@@ -1,10 +1,159 @@
-"""构建期补丁：TG 回复打字机模式（流式接收 → 按句切段 → 逐句发送，句间 typing）。
+"""构建期补丁：TG 回复打字机模式 v2。
+- 流式接收 → 按句切段 → 短句合并成气泡 → 逐气泡发送，句间 typing
+- 气泡粒度 / 打字节奏全部走环境变量（TG_BUBBLE_*），改完 Restart 即生效，无需改代码
+- 流式与非流式双腿全断时，发送坠机遗言气泡 + 落库 Crash 记录，不再沉默
 Docker 构建时对 heartbeat.py 打补丁，打完即删。本地运行则先执行 python patch_typewriter.py。
 """
 
-NEW_FUNC = 'async def _ask_llm_stream_sentences(client, prompt, temperature=0.8):\n    """流式调用主对话模型，按句子异步产出文本（打字机模式专用）。"""\n    model_name = os.environ.get("CHAT_MODEL_NAME", "gpt-4o-mini")\n    messages = [{"role": "user", "content": prompt}]\n    queue = asyncio.Queue()\n    loop = asyncio.get_running_loop()\n\n    def _stream_worker():\n        try:\n            kwargs = dict(model=model_name, messages=messages, temperature=temperature, stream=True)\n            try:\n                stream = client.chat.completions.create(**kwargs)\n            except Exception as e:\n                # 部分模型（如 kimi-k3）只允许 temperature=1，自动降级重试\n                if "temperature" in str(e).lower():\n                    kwargs["temperature"] = 1\n                    stream = client.chat.completions.create(**kwargs)\n                else:\n                    raise\n            for chunk in stream:\n                try:\n                    delta = chunk.choices[0].delta.content\n                except Exception:\n                    delta = None\n                if delta:\n                    loop.call_soon_threadsafe(queue.put_nowait, delta)\n        except Exception as e:\n            loop.call_soon_threadsafe(queue.put_nowait, e)\n        finally:\n            loop.call_soon_threadsafe(queue.put_nowait, None)\n\n    threading.Thread(target=_stream_worker, daemon=True).start()\n\n    buffer = ""\n    pattern = re.compile(r\'[^。！？!?…\\n]*[。！？!?…\\n]+\')\n    while True:\n        item = await queue.get()\n        if item is None:\n            break\n        if isinstance(item, Exception):\n            raise item\n        buffer += item\n        while True:\n            m = pattern.match(buffer)\n            if not m:\n                break\n            sent = m.group(0).strip()\n            buffer = buffer[m.end():]\n            if sent:\n                yield sent\n        if len(buffer) > 400:  # 保险：过长无句读时强制吐出\n            yield buffer.strip()\n            buffer = ""\n    if buffer.strip():\n        yield buffer.strip()'
-OLD_BLOCK = '                        reply = await _ask_llm_async(client, prompt, temperature=0.8)\n\n                        if reply:\n                            await asyncio.to_thread(\n                                lambda: requests.post(\n                                    f"{base_url}/sendMessage",\n                                    json={"chat_id": chat_id, "text": reply},\n                                    timeout=15\n                                )\n                            )'
-NEW_BLOCK = '                        # 打字机模式：流式接收 → 按句切段 → 逐句发送（句间 typing）\n                        reply_parts = []\n                        try:\n                            async for _sent in _ask_llm_stream_sentences(client, prompt, temperature=0.8):\n                                _sent = _sent.strip()\n                                if not _sent:\n                                    continue\n                                reply_parts.append(_sent)\n                                await asyncio.to_thread(\n                                    lambda s=_sent: requests.post(\n                                        f"{base_url}/sendChatAction",\n                                        json={"chat_id": chat_id, "action": "typing"},\n                                        timeout=10\n                                    )\n                                )\n                                await asyncio.sleep(min(0.08 * len(_sent), 3.0) + 0.3)\n                                await asyncio.to_thread(\n                                    lambda s=_sent: requests.post(\n                                        f"{base_url}/sendMessage",\n                                        json={"chat_id": chat_id, "text": s},\n                                        timeout=15\n                                    )\n                                )\n                        except Exception as _e:\n                            print(f"❌ 流式回复失败: {_e}")\n\n                        # 流式失败时回退：非流式整段发送\n                        if not reply_parts:\n                            _fallback = await _ask_llm_async(client, prompt, temperature=0.8)\n                            if _fallback:\n                                reply_parts.append(_fallback)\n                                await asyncio.to_thread(\n                                    lambda s=_fallback: requests.post(\n                                        f"{base_url}/sendMessage",\n                                        json={"chat_id": chat_id, "text": s},\n                                        timeout=15\n                                    )\n                                )\n\n                        reply = "\\n".join(reply_parts)\n\n                        if reply:'
+NEW_FUNC = r'''async def _ask_llm_stream_sentences(client, prompt, temperature=0.8):
+    """流式调用主对话模型，按句子异步产出文本（打字机 v2：短句合并，粒度可调）。"""
+    model_name = os.environ.get("CHAT_MODEL_NAME", "gpt-4o-mini")
+    min_len = int(os.environ.get("TG_BUBBLE_MIN_LEN", "20"))
+    max_hold = max(min_len * 8, 160)
+    messages = [{"role": "user", "content": prompt}]
+    queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def _stream_worker():
+        try:
+            kwargs = dict(model=model_name, messages=messages, temperature=temperature, stream=True)
+            try:
+                stream = client.chat.completions.create(**kwargs)
+            except Exception as e:
+                # 部分模型（如 kimi-k3）只允许 temperature=1，自动降级重试
+                if "temperature" in str(e).lower():
+                    kwargs["temperature"] = 1
+                    stream = client.chat.completions.create(**kwargs)
+                else:
+                    raise
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta.content
+                except Exception:
+                    delta = None
+                if delta:
+                    loop.call_soon_threadsafe(queue.put_nowait, delta)
+        except Exception as e:
+            loop.call_soon_threadsafe(queue.put_nowait, e)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=_stream_worker, daemon=True).start()
+
+    buffer = ""
+    pending = ""
+    pattern = re.compile(r'[^。！？!?…\n]*[。！？!?…\n]+')
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        if isinstance(item, Exception):
+            raise item
+        buffer += item
+        while True:
+            m = pattern.match(buffer)
+            if not m:
+                break
+            sent = m.group(0)
+            buffer = buffer[m.end():]
+            pending += sent
+            ready = pending.strip()
+            # 严格按最小长度吐泡：攒够 min_len 字才发一个气泡，防碎屏
+            if ready and len(ready) >= min_len:
+                yield ready
+                pending = ""
+        if len(buffer) > 400:  # 保险：过长无句读时强制转入待发送
+            pending += buffer
+            buffer = ""
+        if len(pending.strip()) >= max_hold:  # 保险：攒太久强制吐出
+            yield pending.strip()
+            pending = ""
+    tail = (pending + buffer).strip()
+    if tail:
+        yield tail'''
+
+
+OLD_BLOCK = r'''                        reply = await _ask_llm_async(client, prompt, temperature=0.8)
+
+                        if reply:
+                            await asyncio.to_thread(
+                                lambda: requests.post(
+                                    f"{base_url}/sendMessage",
+                                    json={"chat_id": chat_id, "text": reply},
+                                    timeout=15
+                                )
+                            )'''
+
+
+NEW_BLOCK = r'''                        # 打字机模式 v2：流式接收 → 按句合并 → 逐气泡发送（句间 typing）
+                        _base_delay = float(os.environ.get("TG_BUBBLE_BASE_DELAY", "0.3"))
+                        _per_char = float(os.environ.get("TG_BUBBLE_PER_CHAR", "0.08"))
+                        _max_delay = float(os.environ.get("TG_BUBBLE_MAX_DELAY", "3.0"))
+                        reply_parts = []
+                        _stream_err = ""
+                        try:
+                            async for _sent in _ask_llm_stream_sentences(client, prompt, temperature=0.8):
+                                _sent = _sent.strip()
+                                if not _sent:
+                                    continue
+                                reply_parts.append(_sent)
+                                await asyncio.to_thread(
+                                    lambda s=_sent: requests.post(
+                                        f"{base_url}/sendChatAction",
+                                        json={"chat_id": chat_id, "action": "typing"},
+                                        timeout=10
+                                    )
+                                )
+                                await asyncio.sleep(min(_per_char * len(_sent), _max_delay) + _base_delay)
+                                await asyncio.to_thread(
+                                    lambda s=_sent: requests.post(
+                                        f"{base_url}/sendMessage",
+                                        json={"chat_id": chat_id, "text": s},
+                                        timeout=15
+                                    )
+                                )
+                        except Exception as _e:
+                            _stream_err = str(_e)
+                            print(f"❌ 流式回复失败: {_e}")
+
+                        # 流式失败时回退：非流式整段发送
+                        if not reply_parts:
+                            _fallback = await _ask_llm_async(client, prompt, temperature=0.8)
+                            if _fallback:
+                                reply_parts.append(_fallback)
+                                await asyncio.to_thread(
+                                    lambda s=_fallback: requests.post(
+                                        f"{base_url}/sendMessage",
+                                        json={"chat_id": chat_id, "text": s},
+                                        timeout=15
+                                    )
+                                )
+                            else:
+                                print("❌ 回退回复也为空（LLM 双腿全断）")
+
+                        # 双腿全断：坠机遗言气泡 + 落库，不让沉默背锅
+                        if not reply_parts:
+                            _crash = (
+                                "🪦 乌鸦坠机：LLM 调用失败，一句话都没接上。\n"
+                                f"原因：{(_stream_err or '未知')[:300]}\n"
+                                "去查 Zeabur Variables（CHAT_MODEL_NAME / CHAT_API_KEY）或账户额度。"
+                            )
+                            await asyncio.to_thread(
+                                lambda s=_crash: requests.post(
+                                    f"{base_url}/sendMessage",
+                                    json={"chat_id": chat_id, "text": s},
+                                    timeout=15
+                                )
+                            )
+                            await asyncio.to_thread(
+                                _save_memory_to_db, "🪦 坠机记录",
+                                f"用户: {text}\n坠机原因: {(_stream_err or '未知')[:300]}", "流水", "故障", "Crash"
+                            )
+
+                        reply = "\n".join(reply_parts)
+
+                        if reply:'''
+
 
 with open('heartbeat.py', 'r', encoding='utf-8') as f:
     s = f.read()
@@ -19,4 +168,4 @@ s = s.replace(OLD_BLOCK, NEW_BLOCK, 1)
 with open('heartbeat.py', 'w', encoding='utf-8') as f:
     f.write(s)
 
-print("patched: heartbeat.py (typewriter mode)")
+print("patched: heartbeat.py (typewriter v2)")
