@@ -22,8 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y --auto-remove gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制项目源码
-COPY server.py gateway.py heartbeat.py napcat.py ./
+# 复制项目源码 + 构建期补丁
+COPY server.py gateway.py heartbeat.py napcat.py patch_temperature.py ./
+
+# 应用温度兼容性补丁（kimi-k3 等模型只允许 temperature=1），打完即删
+RUN python patch_temperature.py && rm patch_temperature.py
 
 # 暴露端口 (云平台通过 PORT 环境变量覆盖)
 ENV PORT=10000
