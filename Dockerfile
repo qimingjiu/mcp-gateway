@@ -23,10 +23,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制项目源码 + 构建期补丁
-COPY server.py gateway.py heartbeat.py napcat.py patch_temperature.py ./
+COPY server.py gateway.py heartbeat.py napcat.py patch_temperature.py patch_typewriter.py ./
 
-# 应用温度兼容性补丁（kimi-k3 等模型只允许 temperature=1），打完即删
-RUN python patch_temperature.py && rm patch_temperature.py
+# 应用构建期补丁（kimi-k3 温度兼容 + TG 打字机模式），打完即删
+RUN python patch_temperature.py && python patch_typewriter.py && rm patch_temperature.py patch_typewriter.py
 
 # 暴露端口 (云平台通过 PORT 环境变量覆盖)
 ENV PORT=10000
