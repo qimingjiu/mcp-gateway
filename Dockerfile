@@ -23,11 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制项目源码 + 构建期补丁
-COPY server.py gateway.py heartbeat.py napcat.py patch_temperature.py patch_typewriter.py patch_deecho.py ./
+COPY server.py gateway.py heartbeat.py napcat.py patch_temperature.py patch_typewriter.py patch_deecho.py patch_tgwatch.py ./
 
-# 应用构建期补丁（kimi-k3 温度兼容 + 防自食五件套 + TG 打字机模式），打完即删
-# 注意顺序：deecho 必须在 typewriter 之前（打字机替换的是 deecho 改完后的相邻代码块）
-RUN python patch_temperature.py && python patch_deecho.py && python patch_typewriter.py && rm patch_temperature.py patch_typewriter.py patch_deecho.py
+# 应用构建期补丁（kimi-k3 温度兼容 + 防自食五件套 + TG 打字机模式 + TG 侦察兵），打完即删
+# 注意顺序：deecho 必须在 typewriter 之前（打字机替换的是 deecho 改完后的相邻代码块）；tgwatch 最后
+RUN python patch_temperature.py && python patch_deecho.py && python patch_typewriter.py && python patch_tgwatch.py && rm patch_temperature.py patch_typewriter.py patch_deecho.py patch_tgwatch.py
 
 # 暴露端口 (云平台通过 PORT 环境变量覆盖)
 ENV PORT=10000
@@ -37,5 +37,5 @@ EXPOSE 10000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT}/health', timeout=5)" || exit 1
 
-# 启动命令
-CMD ["python", "server.py"]
+# 启动命令（-u 关闭 stdout 缓冲，否则 print 在 Zeabur 日志里不可见，教训：2026-08-07 TG 静默案）
+CMD ["python", "-u", "server.py"]
