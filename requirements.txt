@@ -1,5 +1,7 @@
 # MCP Gateway Core
-mcp
+# ⚠️ mcp 必须锁 1.x：2.0.0 起移除了 mcp.server.fastmcp（FastMCP 独立成包），
+# 不锁版本重建即 ModuleNotFoundError 启动崩溃（2026-08-07 实战翻车）
+mcp==1.29.0
 uvicorn
 python-dotenv
 starlette
