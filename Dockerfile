@@ -23,10 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制项目源码 + 构建期补丁
-COPY server.py gateway.py heartbeat.py napcat.py patch_temperature.py patch_typewriter.py ./
+COPY server.py gateway.py heartbeat.py napcat.py patch_temperature.py patch_typewriter.py patch_deecho.py ./
 
-# 应用构建期补丁（kimi-k3 温度兼容 + TG 打字机模式），打完即删
-RUN python patch_temperature.py && python patch_typewriter.py && rm patch_temperature.py patch_typewriter.py
+# 应用构建期补丁（kimi-k3 温度兼容 + 防自食五件套 + TG 打字机模式），打完即删
+# 注意顺序：deecho 必须在 typewriter 之前（打字机替换的是 deecho 改完后的相邻代码块）
+RUN python patch_temperature.py && python patch_deecho.py && python patch_typewriter.py && rm patch_temperature.py patch_typewriter.py patch_deecho.py
 
 # 暴露端口 (云平台通过 PORT 环境变量覆盖)
 ENV PORT=10000
